@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+.env
+.DS_Store
+/dist
+node_modules/
+# cargo-leptos build output
+/crates/server/pkg

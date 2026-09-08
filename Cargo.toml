@@ -1,0 +1,43 @@
+[workspace]
+members = ["crates/db", "crates/scraper", "crates/server"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/NaeCqde/chintai-selector"
+
+# Shared dependency versions. Individual crates opt in via `dep.workspace = true`
+# and pick their own feature sets so the dependency graph stays minimal:
+#   db      -> no server/scraper deps
+#   scraper -> may depend on db (it persists what it collects)
+#   server  -> depends on db + scraper
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "gzip",
+    "rustls-tls",
+] }
+sea-orm = { version = "1.1", default-features = false, features = [
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+] }
+sea-orm-migration = { version = "1.1", default-features = false, features = [
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+] }
+chrono = { version = "0.4", features = ["serde"] }
+scraper = "0.21"
+url = "2"
+
+[profile.release]
+strip = true
