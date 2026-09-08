@@ -87,6 +87,30 @@ impl HttpClient {
         let resp = self.get(url, query).await?.error_for_status()?;
         Ok(resp.json::<T>().await?)
     }
+
+    /// Rate-limited POST of a JSON body with extra headers, parsing a JSON
+    /// response. Used for the Google Routes API.
+    pub async fn post_json<B, T>(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &B,
+    ) -> Result<T, HttpError>
+    where
+        B: serde::Serialize + ?Sized,
+        T: serde::de::DeserializeOwned,
+    {
+        let parsed = url::Url::parse(url).map_err(|e| HttpError::BadUrl(e.to_string()))?;
+        let host = parsed.host_str().unwrap_or_default().to_owned();
+        self.limiter.acquire(&host).await;
+
+        let mut req = self.inner.post(parsed).json(body);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = req.send().await?.error_for_status()?;
+        Ok(resp.json::<T>().await?)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

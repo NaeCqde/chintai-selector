@@ -13,6 +13,7 @@
 
 pub mod geocode;
 pub mod http;
+pub mod route;
 
 pub use http::HttpClient;
 
