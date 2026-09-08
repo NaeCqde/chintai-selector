@@ -127,37 +127,56 @@ fn finish(db: &chintai_db::DatabaseConnection, run_id: i32, res: &Result<u64, St
 async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> anyhow::Result<()> {
     use chintai_scraper::rental::{ingest_area, Homes, Suumo};
 
-    let mut suumo_area = None;
-    let mut homes_area = None;
+    let mut suumo_areas: Vec<String> = Vec::new();
+    let mut homes_areas: Vec<String> = Vec::new();
     let mut pages = 3u32;
+    let mut interval_ms = 1000u64; // user asked for a gentle 1 req/s
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--suumo" => suumo_area = it.next().cloned(),
-            "--homes" => homes_area = it.next().cloned(),
+            "--suumo" => it.next().map(|s| suumo_areas.push(s.clone())).unwrap_or(()),
+            "--homes" => it.next().map(|s| homes_areas.push(s.clone())).unwrap_or(()),
             "--pages" => pages = it.next().and_then(|s| s.parse().ok()).unwrap_or(pages),
+            "--interval-ms" => {
+                interval_ms = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(interval_ms)
+            }
             _ => {}
         }
     }
-    if suumo_area.is_none() && homes_area.is_none() {
-        anyhow::bail!("rentals needs --suumo <area> and/or --homes <area> (e.g. --suumo tokyo/sc_setagaya --homes tokyo/setagaya-city)");
+    if suumo_areas.is_empty() && homes_areas.is_empty() {
+        anyhow::bail!("rentals needs --suumo <area> and/or --homes <area> (repeatable). e.g. --suumo tokyo/sc_setagaya --homes tokyo/setagaya-city");
     }
+    let iv = std::time::Duration::from_millis(interval_ms);
+    log::info!(
+        "rentals: {} suumo + {} homes areas, {} pages max, {}ms/req",
+        suumo_areas.len(),
+        homes_areas.len(),
+        pages,
+        interval_ms
+    );
 
-    if let Some(area) = suumo_area {
+    for area in suumo_areas {
         let run = chintai_db::ingest_run_start(db, &format!("rentals:suumo:{area}")).await?;
-        let src = Suumo::new(HttpClient::new(std::time::Duration::from_millis(2500)));
+        let src = Suumo::new(HttpClient::new(iv));
         let res = ingest_area(db, &src, &area, pages).await;
         log_rentals("suumo", &area, &res);
         chintai_db::ingest_run_finish(db, run, res.is_ok(), Some(&format!("{res:?}"))).await?;
-        res?;
+        if let Err(e) = res {
+            log::error!("suumo {area}: {e}");
+        }
     }
-    if let Some(area) = homes_area {
+    for area in homes_areas {
         let run = chintai_db::ingest_run_start(db, &format!("rentals:homes:{area}")).await?;
-        let src = Homes::new(HttpClient::browser(std::time::Duration::from_millis(2500)));
+        let src = Homes::new(HttpClient::browser(iv));
         let res = ingest_area(db, &src, &area, pages).await;
         log_rentals("homes", &area, &res);
         chintai_db::ingest_run_finish(db, run, res.is_ok(), Some(&format!("{res:?}"))).await?;
-        res?;
+        if let Err(e) = res {
+            log::error!("homes {area}: {e}");
+        }
     }
     Ok(())
 }

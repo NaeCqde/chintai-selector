@@ -126,6 +126,21 @@ pub async fn ingest_area(
             .await?;
             counts.buildings += 1;
 
+            // Approximate coordinates from the nearest scraped station (the
+            // list page has no lat/lng, and Nominatim can't pin a coarse ward
+            // address). Good enough for the ranking engine's routing; a later
+            // `ingest geocode` pass refines what's left.
+            if prop.lat.is_none() {
+                for st in &b.stations {
+                    if let Ok(Some(station)) = chintai_db::station_by_name(db, &st.station).await {
+                        let _ =
+                            chintai_db::set_property_coords(db, prop.id, station.lat, station.lng)
+                                .await;
+                        break;
+                    }
+                }
+            }
+
             for u in &b.units {
                 let unit = upsert_unit(
                     db,

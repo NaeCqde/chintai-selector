@@ -734,6 +734,29 @@ pub async fn stations_all(db: &DatabaseConnection) -> Result<Vec<station::Model>
     station::Entity::find().all(db).await
 }
 
+/// Best station match for a name like "三軒茶屋" / "三軒茶屋駅": exact (with and
+/// without the trailing 駅), then a prefix match. Used to give a scraped
+/// property approximate coordinates without a geocoding round-trip.
+pub async fn station_by_name(
+    db: &DatabaseConnection,
+    name: &str,
+) -> Result<Option<station::Model>, DbErr> {
+    let bare = name.trim().trim_end_matches('駅');
+    for cand in [format!("{bare}駅"), bare.to_string()] {
+        if let Some(m) = station::Entity::find()
+            .filter(station::Column::Name.eq(cand))
+            .one(db)
+            .await?
+        {
+            return Ok(Some(m));
+        }
+    }
+    station::Entity::find()
+        .filter(station::Column::Name.starts_with(bare))
+        .one(db)
+        .await
+}
+
 pub async fn listings_for_unit(
     db: &DatabaseConnection,
     unit_id: i32,
