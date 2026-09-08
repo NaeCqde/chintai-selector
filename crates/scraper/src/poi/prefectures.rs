@@ -50,8 +50,10 @@ pub static PREFECTURES: &[Prefecture] = &[
     Prefecture { code: 10, name: "群馬県",   bbox: (35.99, 138.39, 37.06, 139.68) },
     Prefecture { code: 11, name: "埼玉県",   bbox: (35.75, 138.71, 36.29, 139.90) },
     Prefecture { code: 12, name: "千葉県",   bbox: (34.90, 139.74, 36.10, 140.87) },
-    Prefecture { code: 13, name: "東京都",   bbox: (35.50, 138.94, 35.90, 139.92) },
-    Prefecture { code: 14, name: "神奈川県", bbox: (35.13, 139.00, 35.67, 139.79) },
+    // Tokyo mainland + Tama (Izu/Ogasawara islands excluded); Kanagawa incl.
+    // the Miura peninsula and the western 山北 tip.
+    Prefecture { code: 13, name: "東京都",   bbox: (35.49, 138.90, 35.90, 139.93) },
+    Prefecture { code: 14, name: "神奈川県", bbox: (35.10, 138.90, 35.68, 139.83) },
     Prefecture { code: 15, name: "新潟県",   bbox: (36.74, 137.62, 38.55, 139.90) },
     Prefecture { code: 16, name: "富山県",   bbox: (36.27, 136.77, 36.98, 137.75) },
     Prefecture { code: 17, name: "石川県",   bbox: (36.03, 136.23, 37.86, 137.36) },

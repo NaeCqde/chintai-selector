@@ -10,3 +10,6 @@
 node_modules/
 # cargo-leptos build output
 /crates/server/pkg
+
+*.log
+poi_done.txt

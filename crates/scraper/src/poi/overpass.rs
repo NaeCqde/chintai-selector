@@ -59,9 +59,21 @@ pub struct Overpass {
     http: HttpClient,
 }
 
+impl Default for Overpass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Overpass {
-    pub fn new(http: HttpClient) -> Self {
-        // Overpass' public instances are shared infrastructure — go easy.
+    /// Builds its own client with a 210 s read timeout — a dense prefecture
+    /// tile can legitimately take a couple of minutes to compute server-side
+    /// (`[timeout:180]` in the QL).
+    pub fn new() -> Self {
+        let http = HttpClient::slow(
+            std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(210),
+        );
         for host in [
             "overpass-api.de",
             "overpass.kumi.systems",

@@ -35,19 +35,25 @@ const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
 impl HttpClient {
     pub fn new(min_interval: Duration) -> Self {
-        Self::build(min_interval, HONEST_UA, false)
+        Self::build(min_interval, Duration::from_secs(40), HONEST_UA, false)
     }
 
     /// Client that presents as Chrome with `Accept-Language: ja`. Some listing
     /// sites (LIFULL HOME'S) 403 anything else. Personal use — see project README.
     pub fn browser(min_interval: Duration) -> Self {
-        Self::build(min_interval, BROWSER_UA, true)
+        Self::build(min_interval, Duration::from_secs(40), BROWSER_UA, true)
     }
 
-    fn build(min_interval: Duration, ua: &str, browser_headers: bool) -> Self {
+    /// Honest-UA client with a long read timeout, for endpoints that legitimately
+    /// take minutes (Overpass over a dense prefecture tile).
+    pub fn slow(min_interval: Duration, timeout: Duration) -> Self {
+        Self::build(min_interval, timeout, HONEST_UA, false)
+    }
+
+    fn build(min_interval: Duration, timeout: Duration, ua: &str, browser_headers: bool) -> Self {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(40))
+            .timeout(timeout)
             .gzip(true)
             .user_agent(ua);
         if browser_headers {

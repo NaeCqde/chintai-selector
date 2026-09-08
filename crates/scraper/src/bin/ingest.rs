@@ -34,7 +34,7 @@ async fn run() -> anyhow::Result<()> {
     let http = HttpClient::default();
 
     match cmd {
-        "overpass" => overpass_cmd(&db, &http, &args[1..]).await,
+        "overpass" => overpass_cmd(&db, &args[1..]).await,
         "rentals" => rentals_cmd(&db, &args[1..]).await,
         "geocode" => geocode_cmd(&db, &http, &args[1..]).await,
         "help" | "-h" | "--help" => {
@@ -51,12 +51,11 @@ async fn run() -> anyhow::Result<()> {
 
 async fn overpass_cmd(
     db: &chintai_db::DatabaseConnection,
-    http: &HttpClient,
     args: &[String],
 ) -> anyhow::Result<()> {
     let opts = Opts::parse(args);
     let grid = opts.grid.unwrap_or((3, 3));
-    let overpass = Overpass::new(http.clone());
+    let overpass = Overpass::new();
 
     let (task, targets): (String, Vec<u32>) = if opts.all {
         (
