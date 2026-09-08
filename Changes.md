@@ -2,37 +2,52 @@
 
 このコミットの内容。次のコミットでまっさらにして書き直す。
 
-## ワークスペース初期化
+## `chintai-db`: スキーマ + マイグレーション + リポジトリ関数
 
-`open-remote-url` からのコピー物を土台に、賃貸選び支援 Web サービス
-`chintai-selector` の骨組みを作った。
+SQLite 永続化層の中身を実装した。
 
-### 削除
+### エンティティ（`crates/db/src/entities/`）
 
-- コピー由来の不要クレート・ファイルを全削除:
-  `sender/` `receiver/` `shared/` `client/` `docs/` `scripts/`、
-  ルートとサブの `Cargo.lock`、リリース用 `.github/workflows/ci.yml`、`.prettierrc`。
+- `enums.rs` — `BrandKind` / `PriceTier` / `StoreSource` / `TravelMode` /
+  `RouteProviderKind` / `ListingSite`。すべて `snake_case` テキスト保存
+  （SQLite ファイルを読みやすく、変種追加で番号がずれない）。
+- `brand` — コンビニ / スーパーのチェーンと価格帯（`name` 一意）。
+- `store` — ブランドに紐づく実店舗。`(source, external_id)` 一意。座標欠落の
+  重複行は後段で近接名寄せ。
+- `delivery` — 物流拠点。店舗受取なら `store_id`、PUDO ロッカー等の非店舗は
+  `store_id` NULL で座標直持ち。`(carrier, external_id)` 一意。
+- `property` / `unit` / `listing` — 建物 / 部屋 / サイト別元データ。
+  `unit` は `(property_id, dedup_key)`、`listing` は `(site, site_listing_id)` 一意。
+- `railway_line` / `station` / `station_line` — 公共交通ルートの会社・路線・
+  駅・駅ランク（`station_line.train_types_json` = その駅に停まる種別）。
+- `route_cache` — 丸めた座標＋モードでキー化。全行程を `result_json` に格納
+  （徒歩の高低差、公共交通の会社/路線/種別/駅/時刻/停車数、最速〜最遅）。UI の
+  乗換案内表示に使う。
+- `ingest_run` — 定期更新の実行記録。
 
-### 追加
+### マイグレーション（`m20260908_000001_init`）
 
-- ルート `Cargo.toml` を `[workspace]` に作り直し。`crates/db` `crates/scraper`
-  `crates/server` の 3 メンバー。共有バージョンは `[workspace.dependencies]` に集約。
-- **`crates/db`（`chintai-db`）** — SeaORM + SQLite の永続化層。今回は `connect` の
-  置き場となる `lib.rs` のみ。スキーマ（エンティティ／マイグレーション）は次段。
-  scraper・server に依存しない。
-- **`crates/scraper`（`chintai-scraper`）** — `reqwest` のみで外部と通信（ブラウザ不使用）。
-  共有 HTTP クライアント生成 `http_client()` と、定期更新バイナリ `ingest` の雛形。
-  `chintai-db` に依存、server には依存しない。
-- **`crates/server`（`chintai-server`）** — Leptos SSR + JSON API + フィルタ/ランキング
-  エンジンの置き場。今回は `axum` で `/api/health` を返すだけ。`db` と `scraper` に依存。
-- `.gitignore`（`target/`、`*.sqlite*`、`.env`、`cargo-leptos` の `pkg/` など）。
-- `.github/workflows/ci.yml` を「`cargo fmt --check` + `clippy -D warnings` + `test`」に置換。
-- `git init` ＋ リモート `origin`（`github.com/NaeCqde/chintai-selector`）。
+- エンティティから `create_table_from_entity` でテーブル生成（型・NULL 可否・
+  単一列 UNIQUE を引き継ぐ）。複合 UNIQUE と検索用インデックスはマクロで明示追加。
+- 親→子の順で作成（外部キー）。
 
-## 確認
+### リポジトリ関数（`crates/db/src/repo.rs`）
 
-- `cargo build --workspace` 成功。
-- `cargo fmt --all --check` 通過。
-- `cargo clippy --workspace --all-targets -- -D warnings` 警告なし。
-- `LISTEN=127.0.0.1:3577 chintai-server` 起動 → `GET /api/health` が `ok` を返すことを確認。
-- いずれも Windows 上で実行。
+- `upsert_brand` / `upsert_store` / `upsert_delivery` / `upsert_property` /
+  `upsert_unit` / `record_listing` / `upsert_railway_line` / `upsert_station` /
+  `upsert_station_line` / `route_cache_get` / `route_cache_put` /
+  `ingest_run_start` / `ingest_run_finish` / `count`。
+- パターンは「`INSERT ... ON CONFLICT DO UPDATE`（原子的）→ 自然キーで `SELECT`
+  し直して行を返す」。`exec_with_returning` は使わない —— SQLite の
+  `last_insert_rowid()` は接続グローバルで、他テーブルへの挿入が挟まると
+  conflict-update が誤った行（または無し）を返すため（実テストで再現・回避を確認）。
+- `connect()` はインメモリ URL を検知して接続プールを 1 に固定
+  （`:memory:` は接続ごとに別 DB になるため）。
+
+### 確認
+
+- `cargo test -p chintai-db` — インメモリ SQLite で 6 ケース green
+  （brand/store/delivery のべき等 upsert、property→unit→listing 連鎖、
+  route_cache の座標丸めキー一致、ingest_run ライフサイクル）。
+- `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings` 通過。
+- Windows 上で実行。

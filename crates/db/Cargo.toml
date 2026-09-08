@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
+async-trait.workspace = true
 log.workspace = true
 serde.workspace = true
 sea-orm.workspace = true
