@@ -1,0 +1,421 @@
+//! The filter + ranking engine.
+//!
+//! 1. Pull every unit + geocoded property from the DB and apply the static
+//!    filters (rent, area, layout, building age) in memory.
+//! 2. For each surviving property, find the nearest convenience store /
+//!    supermarket / cheap supermarket / parcel point (straight-line) and drop
+//!    it if a POI walk-distance filter fails.
+//! 3. For each place, compute the real route (cached) and drop the property if
+//!    any place is over its time limit.
+//! 4. Normalise each ranking metric to 0..1, combine with the given weights,
+//!    sort, and return the top N with full per-place route detail.
+
+mod geo;
+mod types;
+
+pub use types::*;
+
+use std::collections::HashMap;
+
+use chintai_db::entities::enums::PriceTier;
+use chintai_db::{entities, DatabaseConnection};
+use chintai_scraper::route::{route_cached, LatLng, RouteProvider};
+use futures::stream::{self, StreamExt};
+
+use geo::{haversine_m, walk_minutes};
+
+/// How many route lookups to run concurrently. The scraper's per-host rate
+/// limiter still paces the actual requests; this just overlaps the waiting.
+const ROUTE_CONCURRENCY: usize = 6;
+
+pub struct Engine<'a> {
+    pub db: &'a DatabaseConnection,
+    pub provider: &'a dyn RouteProvider,
+}
+
+impl<'a> Engine<'a> {
+    pub fn new(db: &'a DatabaseConnection, provider: &'a dyn RouteProvider) -> Self {
+        Self { db, provider }
+    }
+
+    pub async fn search(&self, req: &SearchRequest) -> anyhow::Result<SearchResponse> {
+        let ranking = effective_ranking(&req.filters, &req.ranking);
+        let this_year = current_year();
+
+        // --- 1. load + static filter -------------------------------------
+        let units = chintai_db::units_with_geocoded_property(self.db).await?;
+        let mut by_prop: HashMap<i32, (entities::property::Model, Vec<entities::unit::Model>)> =
+            HashMap::new();
+        for (u, p) in units {
+            by_prop
+                .entry(p.id)
+                .or_insert_with(|| (p, Vec::new()))
+                .1
+                .push(u);
+        }
+
+        let stores = chintai_db::stores_with_brand(self.db).await?;
+        let deliveries = chintai_db::deliveries_with_coords(self.db).await?;
+
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for (_, (prop, units)) in by_prop {
+            if let Some(max_age) = req.filters.max_built_age {
+                if let Some(by) = prop.built_year {
+                    if this_year - by > max_age {
+                        continue;
+                    }
+                }
+            }
+            let matching: Vec<_> = units
+                .into_iter()
+                .filter(|u| unit_passes(u, &req.filters))
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+
+            let (plat, plng) = (prop.lat.unwrap(), prop.lng.unwrap());
+            let near = NearbyPois::compute(plat, plng, &stores, &deliveries);
+
+            if let Some(max) = req.filters.max_conveni_walk_min {
+                if near.conveni_m.map(walk_minutes).is_none_or(|m| m > max) {
+                    continue;
+                }
+            }
+            if let Some(max) = req.filters.max_super_walk_min {
+                let d = if req.filters.require_cheap_super {
+                    near.cheap_super_m
+                } else {
+                    near.super_m
+                };
+                if d.map(walk_minutes).is_none_or(|m| m > max) {
+                    continue;
+                }
+            }
+            if let Some(max_m) = req.filters.max_delivery_m {
+                if near.delivery_m.is_none_or(|m| m > max_m) {
+                    continue;
+                }
+            }
+
+            candidates.push(Candidate {
+                prop,
+                units: matching,
+                near,
+            });
+        }
+        let considered = candidates.len();
+
+        // --- 2. route every candidate against every place ---------------
+        let routed: Vec<RoutedCandidate> =
+            stream::iter(candidates.into_iter().map(|c| async move {
+                let origin = LatLng::new(c.prop.lat.unwrap(), c.prop.lng.unwrap());
+                let mut places = Vec::with_capacity(req.places.len());
+                let mut all_ok = true;
+                for place in &req.places {
+                    let dest = LatLng::new(place.lat, place.lng);
+                    let route = match route_cached(self.db, self.provider, origin, dest, place.mode)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            log::warn!("route {} -> {}: {e}", c.prop.name, place.label);
+                            all_ok = false;
+                            break;
+                        }
+                    };
+                    let minutes = (route.duration.as_secs() as f64 / 60.0).ceil() as u32;
+                    let within = minutes <= place.max_minutes;
+                    all_ok &= within;
+                    places.push(PlaceAccess {
+                        label: place.label.clone(),
+                        minutes,
+                        within_limit: within,
+                        route,
+                    });
+                }
+                all_ok.then_some(RoutedCandidate { c, places })
+            }))
+            .buffer_unordered(ROUTE_CONCURRENCY)
+            .filter_map(|x| async move { x })
+            .collect()
+            .await;
+
+        let matched = routed.len();
+
+        // --- 3. score + sort ------------------------------------------------
+        let metrics: Vec<Metrics> = routed.iter().map(Metrics::of).collect();
+        let ranges = MetricRanges::of(&metrics);
+
+        let mut scored: Vec<(f64, RoutedCandidate, Metrics)> = routed
+            .into_iter()
+            .zip(metrics)
+            .map(|(rc, m)| {
+                let score = ranking
+                    .iter()
+                    .map(|spec| spec.weight * ranges.goodness(spec, &m))
+                    .sum();
+                (score, rc, m)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(req.limit as usize);
+
+        // --- 4. materialise ------------------------------------------------
+        let mut results = Vec::with_capacity(scored.len());
+        for (i, (score, rc, _)) in scored.into_iter().enumerate() {
+            results.push(self.to_ranked(i as u32 + 1, score, rc).await?);
+        }
+
+        Ok(SearchResponse {
+            results,
+            considered,
+            matched,
+        })
+    }
+
+    async fn to_ranked(
+        &self,
+        rank: u32,
+        score: f64,
+        rc: RoutedCandidate,
+    ) -> anyhow::Result<RankedProperty> {
+        let RoutedCandidate { c, places } = rc;
+        let mut units = c.units;
+        units.sort_by_key(|u| u.rent_yen.unwrap_or(i32::MAX));
+
+        let mut views = Vec::with_capacity(units.len());
+        for u in &units {
+            let sources = chintai_db::listings_for_unit(self.db, u.id)
+                .await?
+                .into_iter()
+                .map(|l| UnitSource {
+                    site: format!("{:?}", l.site).to_lowercase(),
+                    url: l.url,
+                })
+                .collect();
+            views.push(unit_view(u, sources));
+        }
+        let best_unit = views.remove(0);
+
+        Ok(RankedProperty {
+            rank,
+            score,
+            property_id: c.prop.id,
+            name: c.prop.name,
+            address: c.prop.address,
+            lat: c.prop.lat.unwrap(),
+            lng: c.prop.lng.unwrap(),
+            built_year: c.prop.built_year,
+            structure: c.prop.structure,
+            best_unit,
+            other_units: views,
+            places,
+            nearest_conveni_m: c.near.conveni_m,
+            nearest_super_m: c.near.super_m,
+            nearest_cheap_super_m: c.near.cheap_super_m,
+            nearest_delivery_m: c.near.delivery_m,
+        })
+    }
+}
+
+// --------------------------------------------------------------------------
+
+struct Candidate {
+    prop: entities::property::Model,
+    units: Vec<entities::unit::Model>,
+    near: NearbyPois,
+}
+
+struct RoutedCandidate {
+    c: Candidate,
+    places: Vec<PlaceAccess>,
+}
+
+#[derive(Default)]
+struct NearbyPois {
+    conveni_m: Option<f64>,
+    super_m: Option<f64>,
+    cheap_super_m: Option<f64>,
+    delivery_m: Option<f64>,
+}
+
+impl NearbyPois {
+    fn compute(
+        lat: f64,
+        lng: f64,
+        stores: &[(entities::store::Model, entities::brand::Model)],
+        deliveries: &[entities::delivery::Model],
+    ) -> Self {
+        use chintai_db::entities::enums::BrandKind;
+        let mut n = NearbyPois::default();
+        for (s, b) in stores {
+            let d = haversine_m(lat, lng, s.lat.unwrap(), s.lng.unwrap());
+            match b.kind {
+                BrandKind::ConvenienceStore => min_into(&mut n.conveni_m, d),
+                BrandKind::Supermarket => {
+                    min_into(&mut n.super_m, d);
+                    if b.price_tier == PriceTier::Cheap {
+                        min_into(&mut n.cheap_super_m, d);
+                    }
+                }
+            }
+        }
+        for de in deliveries {
+            let d = haversine_m(lat, lng, de.lat.unwrap(), de.lng.unwrap());
+            min_into(&mut n.delivery_m, d);
+        }
+        n
+    }
+}
+
+fn min_into(slot: &mut Option<f64>, v: f64) {
+    *slot = Some(slot.map_or(v, |cur| cur.min(v)));
+}
+
+fn unit_passes(u: &entities::unit::Model, f: &Filters) -> bool {
+    if let Some(max) = f.max_rent_yen {
+        if u.rent_yen.is_none_or(|r| r > max) {
+            return false;
+        }
+    }
+    if let Some(min) = f.min_area_m2 {
+        if u.area_m2.is_none_or(|a| a < min) {
+            return false;
+        }
+    }
+    if !f.layouts.is_empty() {
+        match &u.layout {
+            Some(l) if f.layouts.iter().any(|w| w.eq_ignore_ascii_case(l)) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn unit_view(u: &entities::unit::Model, sources: Vec<UnitSource>) -> UnitView {
+    UnitView {
+        unit_id: u.id,
+        floor: u.floor.clone(),
+        layout: u.layout.clone(),
+        area_m2: u.area_m2,
+        rent_yen: u.rent_yen,
+        admin_fee_yen: u.admin_fee_yen,
+        deposit_yen: u.deposit_yen,
+        key_money_yen: u.key_money_yen,
+        sources,
+    }
+}
+
+fn effective_ranking(_f: &Filters, given: &[RankSpec]) -> Vec<RankSpec> {
+    if given.is_empty() {
+        vec![
+            RankSpec::new(RankKey::AccessTotal, 1.0),
+            RankSpec::new(RankKey::Rent, 0.5),
+        ]
+    } else {
+        given.to_vec()
+    }
+}
+
+fn current_year() -> i32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    1970 + (secs / 31_556_952) as i32
+}
+
+// --- scoring --------------------------------------------------------------
+
+const N_METRICS: usize = 8;
+
+fn metric_idx(k: RankKey) -> usize {
+    match k {
+        RankKey::AccessTotal => 0,
+        RankKey::AccessWorst => 1,
+        RankKey::Rent => 2,
+        RankKey::Area => 3,
+        RankKey::RentPerArea => 4,
+        RankKey::NearestSuper => 5,
+        RankKey::NearestConveni => 6,
+        RankKey::BuildYear => 7,
+    }
+}
+
+/// One candidate's raw metric values, indexed by [`metric_idx`].
+#[derive(Clone, Copy)]
+struct Metrics([f64; N_METRICS]);
+
+impl Metrics {
+    fn of(rc: &RoutedCandidate) -> Self {
+        let mins: Vec<f64> = rc.places.iter().map(|p| p.minutes as f64).collect();
+        let cheapest =
+            rc.c.units
+                .iter()
+                .filter_map(|u| u.rent_yen)
+                .min()
+                .unwrap_or(0) as f64;
+        let area =
+            rc.c.units
+                .iter()
+                .filter_map(|u| u.area_m2)
+                .fold(0.0_f64, f64::max);
+        let mut v = [0.0; N_METRICS];
+        v[0] = mins.iter().sum();
+        v[1] = mins.iter().cloned().fold(0.0, f64::max);
+        v[2] = cheapest;
+        v[3] = area;
+        v[4] = if area > 0.0 {
+            cheapest / area
+        } else {
+            cheapest
+        };
+        v[5] =
+            rc.c.near
+                .cheap_super_m
+                .or(rc.c.near.super_m)
+                .unwrap_or(5_000.0);
+        v[6] = rc.c.near.conveni_m.unwrap_or(3_000.0);
+        v[7] = rc.c.prop.built_year.unwrap_or(1970) as f64;
+        Metrics(v)
+    }
+}
+
+struct MetricRanges {
+    lo: [f64; N_METRICS],
+    hi: [f64; N_METRICS],
+}
+
+impl MetricRanges {
+    fn of(all: &[Metrics]) -> Self {
+        let mut lo = [f64::INFINITY; N_METRICS];
+        let mut hi = [f64::NEG_INFINITY; N_METRICS];
+        for m in all {
+            for i in 0..N_METRICS {
+                lo[i] = lo[i].min(m.0[i]);
+                hi[i] = hi[i].max(m.0[i]);
+            }
+        }
+        Self { lo, hi }
+    }
+
+    /// 0..1 where 1 = best, honouring `spec.ascending`.
+    fn goodness(&self, spec: &RankSpec, m: &Metrics) -> f64 {
+        let i = metric_idx(spec.key);
+        let span = self.hi[i] - self.lo[i];
+        let norm = if span.abs() < f64::EPSILON {
+            0.5
+        } else {
+            (m.0[i] - self.lo[i]) / span
+        };
+        if spec.ascending {
+            1.0 - norm
+        } else {
+            norm
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

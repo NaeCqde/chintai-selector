@@ -639,6 +639,70 @@ pub async fn ingest_run_finish(
     Ok(())
 }
 
+// --------------------------------------------------------------------------
+// read models for the ranking engine
+// --------------------------------------------------------------------------
+
+/// Every unit joined to its (coordinate-bearing) property. The engine filters
+/// and ranks in memory — fine at personal scale (thousands of rows).
+pub async fn units_with_geocoded_property(
+    db: &DatabaseConnection,
+) -> Result<Vec<(unit::Model, property::Model)>, DbErr> {
+    let rows = unit::Entity::find()
+        .find_also_related(property::Entity)
+        .all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(u, p)| {
+            let p = p?;
+            (p.lat.is_some() && p.lng.is_some()).then_some((u, p))
+        })
+        .collect())
+}
+
+/// Every store that has coordinates, paired with its brand.
+pub async fn stores_with_brand(
+    db: &DatabaseConnection,
+) -> Result<Vec<(store::Model, brand::Model)>, DbErr> {
+    let rows = store::Entity::find()
+        .find_also_related(brand::Entity)
+        .all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(s, b)| {
+            let b = b?;
+            (s.lat.is_some() && s.lng.is_some()).then_some((s, b))
+        })
+        .collect())
+}
+
+pub async fn deliveries_with_coords(
+    db: &DatabaseConnection,
+) -> Result<Vec<delivery::Model>, DbErr> {
+    Ok(delivery::Entity::find()
+        .all(db)
+        .await?
+        .into_iter()
+        .filter(|d| d.lat.is_some() && d.lng.is_some())
+        .collect())
+}
+
+pub async fn stations_all(db: &DatabaseConnection) -> Result<Vec<station::Model>, DbErr> {
+    station::Entity::find().all(db).await
+}
+
+pub async fn listings_for_unit(
+    db: &DatabaseConnection,
+    unit_id: i32,
+) -> Result<Vec<listing::Model>, DbErr> {
+    listing::Entity::find()
+        .filter(listing::Column::UnitId.eq(unit_id))
+        .all(db)
+        .await
+}
+
 /// Total rows returned by a query — handy for ingest logging and tests, e.g.
 /// `count(db, store::Entity::find()).await?`.
 pub async fn count<E>(db: &DatabaseConnection, query: Select<E>) -> Result<u64, DbErr>

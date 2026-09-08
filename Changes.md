@@ -2,65 +2,64 @@
 
 このコミットの内容。次のコミットでまっさらにして書き直す。
 
-## `chintai-scraper::rental` — 賃貸サイトのスクレイパ（SUUMO / LIFULL HOME'S）
+## `chintai-server::engine` — フィルタ / ランキングエンジン + `/api/search`
 
-### `rental/mod.rs`
+### `engine/types.rs`
 
-- `trait ListingSource` — サイト別アダプタ。`list_page(area, page)` が
-  1 ページ分の `ScrapedBuilding`（建物＋`ScrapedUnit` 群）を返す。空 vec = 末尾。
-- `ingest_area(db, source, area, max_pages)` — ページを順にたどり、
-  建物を **正規化した名前＋住所** で `property` に upsert（SUUMO と HOME'S の
-  同一建物を 1 レコードに寄せる）、各部屋を `dedup_key`（階/間取り/面積0.5㎡/賃料1000円）
-  で `unit` に upsert、サイト別の元データを `listing` に記録。
+- `SearchRequest { places, filters, ranking, limit }`（すべて serde、後で Leptos
+  サーバー関数境界をそのまま渡せる）。
+  - `PlaceSpec { label, lat, lng, mode(walk/car/transit), max_minutes }`。
+  - `Filters` = 家賃上限 / 面積下限 / 間取り許可リスト / 築年数上限 /
+    コンビニ・スーパーまでの徒歩分上限 / 安い系スーパー必須 / 荷物拠点まで m。
+  - `RankSpec { key, weight, ascending }`。`RankKey` = AccessTotal / AccessWorst /
+    Rent / Area / RentPerArea / NearestSuper / NearestConveni / BuildYear。
+- `SearchResponse { results, considered, matched }`。
+  `RankedProperty` は best_unit / other_units / 各 place の `PlaceAccess`
+  （所要分・上限内か・**フルの `RouteResult`**＝乗換案内表示用）・
+  最寄りコンビニ/スーパー/安い系スーパー/荷物拠点までの距離。
+  `UnitView.sources` に SUUMO/HOME'S のサイト別 URL。
 
-### `rental/normalize.rs`
+### `engine/mod.rs` — 処理
 
-- 全角→半角、建物種別語（マンション/ハイツ…）除去、住所の丁目/番地/号を `-` に統一。
-- `parse_yen`（"13.5万円"→135000）/ `parse_area` / `parse_walk_min` /
-  `parse_built_year`（"築46年"→西暦）。
+1. `units_with_geocoded_property` を全件ロード → 家賃/面積/間取り/築年で静的フィルタ。
+2. `stores_with_brand` / `deliveries_with_coords` から最寄り POI を直線距離で算出
+   （徒歩 80m/分換算）。POI 徒歩分フィルタで足切り。
+3. 各 place を `route_cached`（`route_cache` 併用、`buffer_unordered(6)` で並行）で計算、
+   全 place が `max_minutes` 以内の物件だけ残す。
+4. 各ランキング指標を 0..1 に正規化 → 重み付き合算 → ソート → 上位 `limit`。
+   ランキング未指定時は AccessTotal(1.0) + Rent(0.5)。
 
-### `rental/suumo.rs`
+### `engine/geo.rs`
 
-- `.cassetteitem` per 建物、`table.cassetteitem_other tr.js-cassette_link` per 部屋。
-- 賃料 `--rent` / 管理費 `--administration` / 敷金 `--deposit` / 礼金 `--gratuity` /
-  間取り `.cassetteitem_madori` / 面積 `.cassetteitem_menseki`。
-- 部屋 ID = チェックボックス value、URL = `/chintai/bc_<id>/`。ページは `?page=N`。
-- SUUMO は素の UA で 200（`HttpClient::new`）。
+- `haversine_m` / `walk_minutes`（80m/分）。
 
-### `rental/homes.rs`
+### `chintai-db`
 
-- `.moduleInner.prg-building` per 建物、`tr.prg-room[data-kykey]` per 部屋。
-- 賃料 `.price .num`（万円）、管理費・敷金/礼金（"1ヶ月" は賃料×月数に換算）、
-  `td.layout` の "1SK44.81m²" を種別/面積に分割。
-- **HOME'S は非ブラウザ UA を 403** → `HttpClient::browser()`（Chrome UA +
-  `Accept-Language: ja`）を使用。個人利用（README 参照）。
+- 読み取りモデル追加: `units_with_geocoded_property` / `stores_with_brand` /
+  `deliveries_with_coords` / `stations_all` / `listings_for_unit`。
 
-### `http.rs`
+### `chintai-server`
 
-- `HttpClient::browser()` を追加。`get_html_jp()` は UTF-8 優先・失敗時 Shift_JIS
-  で日本語ページをデコード（`encoding_rs`）。
-
-### `ingest` バイナリ
-
-- `ingest rentals --suumo <area> --homes <area> [--pages N]`
-- `ingest geocode [--limit N]` — 座標 NULL の property を Nominatim で補完。
+- `POST /api/search`（`SearchRequest` JSON → `SearchResponse` JSON）。
+  起動時に DB 接続＋`route::default_provider`（スクレイプ→鍵があれば API）を構築。
 
 ### テスト
 
-- オフライン単体 16 件（正規化、SUUMO/HOME'S の実 HTML フィクスチャ
-  `tests/fixtures/*_setagaya.html` のパース、駅表記、敷礼の月数換算）。CI で実行。
-- **実ネットワーク実行で確認**: `ingest rentals --suumo tokyo/sc_setagaya
-  --homes tokyo/setagaya-city --pages 1` → SUUMO 20 棟/85 部屋、HOME'S 30 棟/92 部屋
-  を取得。名寄せで property 49 / unit 139 / listing 177（同一部屋に 2 リスティング
-  = 名寄せヒットあり）。`ingest geocode` も実行、Nominatim で座標補完。
-
-### 既知の制約 / 次段
-
-- 一覧ページの住所は粗い（"世田谷区上北沢1"）ため Nominatim のヒット率が低い。
-  詳細ページ（地図座標あり）のスクレイプで改善予定。
-- 一覧ページは同スペックの部屋を区別できず `dedup_key` が粗く寄る。詳細ページ pass で解消。
+- `engine/tests.rs` — インメモリ SQLite に合成データ（近い物件 A・遠い物件 B、
+  コンビニ/安い系スーパー、複数ユニット）＋直線距離モックの `RouteProvider` で:
+  - 時間上限で遠い物件が落ちる / best_unit が最安ユニット / 最寄り POI 距離
+  - 家賃・間取りフィルタ / コンビニ徒歩分フィルタ
+  - Area ランキングで広い物件が 1 位 / route 明細が結果まで伝わる
+  6 ケース green。`geo` の haversine 1 ケース。
 
 ### 確認
 
 - `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings` 通過。
-- `cargo test --workspace` green（オフライン 30、live は ignored）。Windows 上で実行。
+- `cargo test --workspace` green（オフライン 37）。
+- **実データ end-to-end**: 世田谷の賃貸 + 周辺 POI(780 店舗/143 拠点/64 駅) を
+  ingest した SQLite に対し `chintai-server` を起動、`POST /api/search`
+  （渋谷勤務・公共交通 40 分以内・家賃 20 万以下）→ HTTP 200。
+  aiflat明大前(1DK ¥145000, 12 ユニット、SUUMO 重複リスティングを名寄せ) 等が
+  順位付きで返り、最寄りコンビニ 204m / スーパー 408m / 荷物拠点 334m、
+  各 place の所要 15 分・route 明細（スクレイプは transit 合計のみ、明細は API 鍵必要）を確認。
+- Windows 上で実行。
