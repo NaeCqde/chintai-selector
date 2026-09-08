@@ -2,55 +2,65 @@
 
 このコミットの内容。次のコミットでまっさらにして書き直す。
 
-## `chintai-scraper::poi` — 全国 POI 収集（Overpass）＋ `ingest` バイナリ
+## `chintai-scraper::rental` — 賃貸サイトのスクレイパ（SUUMO / LIFULL HOME'S）
 
-### `poi/overpass.rs`
+### `rental/mod.rs`
 
-- `Overpass::ingest_bbox(db, bbox)` — OSM Overpass に 1 クエリで
-  `shop=convenience` / `shop=supermarket` / `amenity=parcel_locker` /
-  `amenity=post_office` / `railway=station` をまとめて取得し、
-  `brand` / `store` / `delivery` / `station` に upsert。node は `lat/lon`、
-  way/relation は `out center` の中心座標を使用。`external_id` = `type/id`。
-- 公開インスタンスが 429/504 を返すことが多いので、
-  overpass-api.de → kumi.systems → openstreetmap.fr → private.coffee の順に
-  ミラーへフォールバック（各ホスト 4 秒間隔）。
-- `ingest_prefecture(code, grid)` — 都道府県 bbox を `NxM` タイルに割って順次取得
-  （既定 3x3、Overpass のタイムアウト回避）。
+- `trait ListingSource` — サイト別アダプタ。`list_page(area, page)` が
+  1 ページ分の `ScrapedBuilding`（建物＋`ScrapedUnit` 群）を返す。空 vec = 末尾。
+- `ingest_area(db, source, area, max_pages)` — ページを順にたどり、
+  建物を **正規化した名前＋住所** で `property` に upsert（SUUMO と HOME'S の
+  同一建物を 1 レコードに寄せる）、各部屋を `dedup_key`（階/間取り/面積0.5㎡/賃料1000円）
+  で `unit` に upsert、サイト別の元データを `listing` に記録。
 
-### `poi/brand_master.rs`
+### `rental/normalize.rs`
 
-- OSM の `brand`/`operator`/`name` タグ（日本語・ローマ字）から正規ブランド名へ正規化。
-- コンビニは無条件 `Expensive`。スーパーは価格帯マスタで判定（業務スーパー/OK/
-  ロピア/まいばすけっと…=Cheap、成城石井/紀ノ国屋/クイーンズ伊勢丹…=Expensive、
-  未知は Cheap）。
-- 荷物受取所の `carrier` 推定（pudo / yamato / sagawa / japanpost / packcity）。
+- 全角→半角、建物種別語（マンション/ハイツ…）除去、住所の丁目/番地/号を `-` に統一。
+- `parse_yen`（"13.5万円"→135000）/ `parse_area` / `parse_walk_min` /
+  `parse_built_year`（"築46年"→西暦）。
 
-### `poi/prefectures.rs`
+### `rental/suumo.rs`
 
-- 47 都道府県のおおまかな bbox と、bbox をタイル分割する `tiles()`。
+- `.cassetteitem` per 建物、`table.cassetteitem_other tr.js-cassette_link` per 部屋。
+- 賃料 `--rent` / 管理費 `--administration` / 敷金 `--deposit` / 礼金 `--gratuity` /
+  間取り `.cassetteitem_madori` / 面積 `.cassetteitem_menseki`。
+- 部屋 ID = チェックボックス value、URL = `/chintai/bc_<id>/`。ページは `?page=N`。
+- SUUMO は素の UA で 200（`HttpClient::new`）。
+
+### `rental/homes.rs`
+
+- `.moduleInner.prg-building` per 建物、`tr.prg-room[data-kykey]` per 部屋。
+- 賃料 `.price .num`（万円）、管理費・敷金/礼金（"1ヶ月" は賃料×月数に換算）、
+  `td.layout` の "1SK44.81m²" を種別/面積に分割。
+- **HOME'S は非ブラウザ UA を 403** → `HttpClient::browser()`（Chrome UA +
+  `Accept-Language: ja`）を使用。個人利用（README 参照）。
+
+### `http.rs`
+
+- `HttpClient::browser()` を追加。`get_html_jp()` は UTF-8 優先・失敗時 Shift_JIS
+  で日本語ページをデコード（`encoding_rs`）。
 
 ### `ingest` バイナリ
 
-- `ingest overpass --pref <1..47> [--grid NxM]` / `--bbox <s,w,n,e>` / `--all`。
-- DB は `CHINTAI_DB` env（SeaORM URL）or 既定 `sqlite://chintai.sqlite?mode=rwc`。
-- 実行を `ingest_run` に記録（開始/終了/件数）。
+- `ingest rentals --suumo <area> --homes <area> [--pages N]`
+- `ingest geocode [--limit N]` — 座標 NULL の property を Nominatim で補完。
 
 ### テスト
 
-- オフライン単体 8 件（都道府県テーブル、タイル分割、ブランド正規化、
-  価格帯、carrier 推定、Overpass 要素パース、QL 生成）。CI で実行。
-- **実ネットワーク実行で確認**: `ingest overpass --bbox 35.655,139.695,35.670,139.710`
-  （渋谷周辺）→ コンビニ 73 / スーパー 5 / 郵便局 9 / 駅 7 を SQLite に投入。
-  ブランドが `ローソン` `セブン-イレブン` `まいばすけっと` 等に正規化され、
-  price_tier も正しく付与されることを DB ダンプで確認。
+- オフライン単体 16 件（正規化、SUUMO/HOME'S の実 HTML フィクスチャ
+  `tests/fixtures/*_setagaya.html` のパース、駅表記、敷礼の月数換算）。CI で実行。
+- **実ネットワーク実行で確認**: `ingest rentals --suumo tokyo/sc_setagaya
+  --homes tokyo/setagaya-city --pages 1` → SUUMO 20 棟/85 部屋、HOME'S 30 棟/92 部屋
+  を取得。名寄せで property 49 / unit 139 / listing 177（同一部屋に 2 リスティング
+  = 名寄せヒットあり）。`ingest geocode` も実行、Nominatim で座標補完。
 
-### 未実装（次段）
+### 既知の制約 / 次段
 
-- ブランド公式店舗一覧ページのアダプタ（`poi/brands/`）。トレイト設計のみ記載。
-- 座標欠落店舗の Google Maps 個別補完（`poi/google_fill`）。
-- 駅と路線（`railway_line` / `station_line`）の紐付け。
+- 一覧ページの住所は粗い（"世田谷区上北沢1"）ため Nominatim のヒット率が低い。
+  詳細ページ（地図座標あり）のスクレイプで改善予定。
+- 一覧ページは同スペックの部屋を区別できず `dedup_key` が粗く寄る。詳細ページ pass で解消。
 
 ### 確認
 
 - `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings` 通過。
-- `cargo test --workspace` green（オフライン 22、live は ignored）。Windows 上で実行。
+- `cargo test --workspace` green（オフライン 30、live は ignored）。Windows 上で実行。

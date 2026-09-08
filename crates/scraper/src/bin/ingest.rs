@@ -35,6 +35,8 @@ async fn run() -> anyhow::Result<()> {
 
     match cmd {
         "overpass" => overpass_cmd(&db, &http, &args[1..]).await,
+        "rentals" => rentals_cmd(&db, &args[1..]).await,
+        "geocode" => geocode_cmd(&db, &http, &args[1..]).await,
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -126,6 +128,100 @@ fn finish(db: &chintai_db::DatabaseConnection, run_id: i32, res: &Result<u64, St
     });
 }
 
+async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> anyhow::Result<()> {
+    use chintai_scraper::rental::{ingest_area, Homes, Suumo};
+
+    let mut suumo_area = None;
+    let mut homes_area = None;
+    let mut pages = 3u32;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--suumo" => suumo_area = it.next().cloned(),
+            "--homes" => homes_area = it.next().cloned(),
+            "--pages" => pages = it.next().and_then(|s| s.parse().ok()).unwrap_or(pages),
+            _ => {}
+        }
+    }
+    if suumo_area.is_none() && homes_area.is_none() {
+        anyhow::bail!("rentals needs --suumo <area> and/or --homes <area> (e.g. --suumo tokyo/sc_setagaya --homes tokyo/setagaya-city)");
+    }
+
+    if let Some(area) = suumo_area {
+        let run = chintai_db::ingest_run_start(db, &format!("rentals:suumo:{area}")).await?;
+        let src = Suumo::new(HttpClient::new(std::time::Duration::from_millis(2500)));
+        let res = ingest_area(db, &src, &area, pages).await;
+        log_rentals("suumo", &area, &res);
+        chintai_db::ingest_run_finish(db, run, res.is_ok(), Some(&format!("{res:?}"))).await?;
+        res?;
+    }
+    if let Some(area) = homes_area {
+        let run = chintai_db::ingest_run_start(db, &format!("rentals:homes:{area}")).await?;
+        let src = Homes::new(HttpClient::browser(std::time::Duration::from_millis(2500)));
+        let res = ingest_area(db, &src, &area, pages).await;
+        log_rentals("homes", &area, &res);
+        chintai_db::ingest_run_finish(db, run, res.is_ok(), Some(&format!("{res:?}"))).await?;
+        res?;
+    }
+    Ok(())
+}
+
+fn log_rentals(
+    site: &str,
+    area: &str,
+    res: &Result<chintai_scraper::rental::RentalCounts, chintai_scraper::rental::RentalError>,
+) {
+    match res {
+        Ok(c) => log::info!(
+            "{site} {area}: {} pages, {} buildings, {} units, {} listings",
+            c.pages,
+            c.buildings,
+            c.units,
+            c.listings
+        ),
+        Err(e) => log::error!("{site} {area}: {e}"),
+    }
+}
+
+async fn geocode_cmd(
+    db: &chintai_db::DatabaseConnection,
+    http: &HttpClient,
+    args: &[String],
+) -> anyhow::Result<()> {
+    use chintai_scraper::geocode::{Geocoder, NominatimGeocoder};
+
+    let limit = args
+        .iter()
+        .position(|a| a == "--limit")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200u64);
+
+    let pending = chintai_db::properties_missing_coords(db, limit).await?;
+    log::info!("geocoding {} properties", pending.len());
+    let geocoder = NominatimGeocoder::new(http.clone());
+    let run = chintai_db::ingest_run_start(db, "geocode").await?;
+    let (mut ok, mut miss) = (0u64, 0u64);
+
+    for p in pending {
+        let query = if p.address.is_empty() {
+            &p.name
+        } else {
+            &p.address
+        };
+        match geocoder.geocode(query).await {
+            Ok(Some(hit)) => {
+                chintai_db::set_property_coords(db, p.id, hit.lat, hit.lng).await?;
+                ok += 1;
+            }
+            _ => miss += 1,
+        }
+    }
+    log::info!("geocoded {ok}, missed {miss}");
+    chintai_db::ingest_run_finish(db, run, true, Some(&format!("ok={ok} miss={miss}"))).await?;
+    Ok(())
+}
+
 #[derive(Default)]
 struct Opts {
     pref: Option<u32>,
@@ -165,8 +261,11 @@ impl Opts {
 fn print_usage() {
     eprintln!(
         "ingest <command>\n\n\
-         overpass --pref <1..47> [--grid NxM]   one prefecture (default grid 3x3)\n\
-         overpass --bbox <s,w,n,e>              one bounding box\n\
-         overpass --all [--grid NxM]            every prefecture\n"
+         overpass --pref <1..47> [--grid NxM]        one prefecture (default grid 3x3)\n\
+         overpass --bbox <s,w,n,e>                   one bounding box\n\
+         overpass --all [--grid NxM]                 every prefecture\n\
+         rentals --suumo <area> --homes <area> [--pages N]\n\
+                                                    e.g. --suumo tokyo/sc_setagaya --homes tokyo/setagaya-city\n\
+         geocode [--limit N]                        fill property coordinates via Nominatim\n"
     );
 }

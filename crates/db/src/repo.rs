@@ -11,7 +11,7 @@
 use chrono::Utc;
 use sea_orm::{
     sea_query::OnConflict, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, Select,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select,
 };
 
 use crate::entities::enums::{
@@ -343,6 +343,38 @@ pub async fn record_listing(
         .one(db)
         .await?
         .ok_or_else(|| missing("listing"))
+}
+
+/// Properties with no coordinates yet (the rental scrapers store an address
+/// only; a geocoding pass fills these in for the ranking engine).
+pub async fn properties_missing_coords(
+    db: &DatabaseConnection,
+    limit: u64,
+) -> Result<Vec<property::Model>, DbErr> {
+    property::Entity::find()
+        .filter(property::Column::Lat.is_null())
+        .order_by_asc(property::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
+pub async fn set_property_coords(
+    db: &DatabaseConnection,
+    id: i32,
+    lat: f64,
+    lng: f64,
+) -> Result<(), DbErr> {
+    property::Entity::update(property::ActiveModel {
+        id: Set(id),
+        lat: Set(Some(lat)),
+        lng: Set(Some(lng)),
+        updated_at: Set(now()),
+        ..Default::default()
+    })
+    .exec(db)
+    .await?;
+    Ok(())
 }
 
 // --------------------------------------------------------------------------

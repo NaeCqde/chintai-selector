@@ -25,21 +25,47 @@ impl Default for HttpClient {
     }
 }
 
+const HONEST_UA: &str = concat!(
+    "chintai-selector/",
+    env!("CARGO_PKG_VERSION"),
+    " (personal use; +https://github.com/NaeCqde/chintai-selector)"
+);
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+
 impl HttpClient {
     pub fn new(min_interval: Duration) -> Self {
-        let inner = reqwest::Client::builder()
+        Self::build(min_interval, HONEST_UA, false)
+    }
+
+    /// Client that presents as Chrome with `Accept-Language: ja`. Some listing
+    /// sites (LIFULL HOME'S) 403 anything else. Personal use — see project README.
+    pub fn browser(min_interval: Duration) -> Self {
+        Self::build(min_interval, BROWSER_UA, true)
+    }
+
+    fn build(min_interval: Duration, ua: &str, browser_headers: bool) -> Self {
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(40))
             .gzip(true)
-            .user_agent(concat!(
-                "chintai-selector/",
-                env!("CARGO_PKG_VERSION"),
-                " (personal use; +https://github.com/NaeCqde/chintai-selector)"
-            ))
-            .build()
-            .expect("reqwest client");
+            .user_agent(ua);
+        if browser_headers {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                    .parse()
+                    .unwrap(),
+            );
+            h.insert(
+                reqwest::header::ACCEPT_LANGUAGE,
+                "ja,en-US;q=0.8,en;q=0.6".parse().unwrap(),
+            );
+            builder = builder.default_headers(h);
+        }
         Self {
-            inner,
+            inner: builder.build().expect("reqwest client"),
             limiter: Arc::new(RateLimiter::new(min_interval)),
         }
     }
@@ -78,6 +104,24 @@ impl HttpClient {
         Ok(resp.text().await?)
     }
 
+    /// GET a page whose bytes are Shift_JIS regardless of what the
+    /// `Content-Type` header claims (SUUMO and LIFULL HOME'S both mislabel
+    /// their Shift_JIS pages as UTF-8). Tries UTF-8 first and only falls back to
+    /// Shift_JIS when that produces replacement characters.
+    pub async fn get_html_jp(
+        &self,
+        url: &str,
+        query: &[(&str, &str)],
+    ) -> Result<String, HttpError> {
+        let bytes = self
+            .get(url, query)
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok(decode_jp(&bytes))
+    }
+
     /// GET + `error_for_status` + parse JSON.
     pub async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
@@ -111,6 +155,16 @@ impl HttpClient {
         let resp = req.send().await?.error_for_status()?;
         Ok(resp.json::<T>().await?)
     }
+}
+
+/// Decode a Japanese web page: UTF-8 if it's clean, otherwise Shift_JIS.
+pub fn decode_jp(bytes: &[u8]) -> String {
+    let (utf8, _, had_errors) = encoding_rs::UTF_8.decode(bytes);
+    if !had_errors {
+        return utf8.into_owned();
+    }
+    let (sjis, _, _) = encoding_rs::SHIFT_JIS.decode(bytes);
+    sjis.into_owned()
 }
 
 #[derive(Debug, thiserror::Error)]

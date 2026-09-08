@@ -14,6 +14,7 @@
 pub mod geocode;
 pub mod http;
 pub mod poi;
+pub mod rental;
 pub mod route;
 
 pub use http::HttpClient;
