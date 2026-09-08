@@ -2,52 +2,55 @@
 
 このコミットの内容。次のコミットでまっさらにして書き直す。
 
-## `chintai-scraper::route` — ルート検索
+## `chintai-scraper::poi` — 全国 POI 収集（Overpass）＋ `ingest` バイナリ
 
-`crates/scraper/src/route/` に A→B の所要時間・徒歩高低差・公共交通の詳細を返す
-モジュールを追加。
+### `poi/overpass.rs`
 
-### 型（`types.rs`）
+- `Overpass::ingest_bbox(db, bbox)` — OSM Overpass に 1 クエリで
+  `shop=convenience` / `shop=supermarket` / `amenity=parcel_locker` /
+  `amenity=post_office` / `railway=station` をまとめて取得し、
+  `brand` / `store` / `delivery` / `station` に upsert。node は `lat/lon`、
+  way/relation は `out center` の中心座標を使用。`external_id` = `type/id`。
+- 公開インスタンスが 429/504 を返すことが多いので、
+  overpass-api.de → kumi.systems → openstreetmap.fr → private.coffee の順に
+  ミラーへフォールバック（各ホスト 4 秒間隔）。
+- `ingest_prefecture(code, grid)` — 都道府県 bbox を `NxM` タイルに割って順次取得
+  （既定 3x3、Overpass のタイムアウト回避）。
 
-- `RouteResult { mode, provider, duration, distance_m, transit_fastest,
-  transit_slowest, walk_ascent_m, walk_descent_m, itineraries }`。
-- `Itinerary { duration, depart, arrive, fare_yen, transfers, legs }`。
-- `Leg` = `Walk` / `Transit` / `Drive` の enum。`TransitLeg` は会社(`operator`)・
-  路線(`line_name`)・種別(`train_type`: 快速/特急…)・乗車/降車駅・時刻・停車数・
-  路線色を保持 → UI の乗換案内表示に使う。
-- すべて serde 対応で `route_cache.result_json` と往復可能。
+### `poi/brand_master.rs`
 
-### プロバイダ（`trait RouteProvider`）
+- OSM の `brand`/`operator`/`name` タグ（日本語・ローマ字）から正規ブランド名へ正規化。
+- コンビニは無条件 `Expensive`。スーパーは価格帯マスタで判定（業務スーパー/OK/
+  ロピア/まいばすけっと…=Cheap、成城石井/紀ノ国屋/クイーンズ伊勢丹…=Expensive、
+  未知は Cheap）。
+- 荷物受取所の `carrier` 推定（pudo / yamato / sagawa / japanpost / packcity）。
 
-- `GoogleRoutesApi`（`api.rs`）— `routes.googleapis.com/.../computeRoutes`。
-  `GOOGLE_MAPS_API_KEY` 必須。フィールドマスクで transitDetails を取得し、
-  会社・路線・駅・時刻・停車数・色を構造化。`computeAlternativeRoutes` で
-  最速〜最遅。種別は headsign / 路線名から推定（API が明示しないため）。
-- `GoogleMapsScrape`（`scrape.rs`）— `reqwest` のみ・ブラウザ不使用。
-  `/maps/dir/.../data=!3e{0|2|3}` の HTML から所要時間を抽出
-  （`[900,"15 分"]` 形式と `"NNNs"` トークン）。**徒歩/車は所要時間が答えの全体**。
-  **公共交通はスクレイプでは会社/路線などの明細が取れない**ため合計時間のみ返し、
-  Fallback が API へエスカレーション。
-- `GsiElevation`（`elevation.rs`）— 国土地理院 標高 API（無料・鍵不要・日本）。
-  ポリライン or 直線を最大 16 点サンプリングして登り/下り累積を算出。
-- `polyline.rs` — Google encoded polyline デコーダ + 間引き。
-- `FallbackProvider`（`fallback.rs`）— 順に試し、mode 別に「十分」な結果を採用。
-  transit は「明細付き」でないと不十分扱い → 次（API）へ。全滅時はスクレイプの
-  合計時間を返す。
-- `default_provider(http, api_key)` = スクレイプ→（鍵があれば）API。
-- `route_cached(db, provider, from, to, mode)` — `route_cache` を見て無ければ計算＆保存。
+### `poi/prefectures.rs`
+
+- 47 都道府県のおおまかな bbox と、bbox をタイル分割する `tiles()`。
+
+### `ingest` バイナリ
+
+- `ingest overpass --pref <1..47> [--grid NxM]` / `--bbox <s,w,n,e>` / `--all`。
+- DB は `CHINTAI_DB` env（SeaORM URL）or 既定 `sqlite://chintai.sqlite?mode=rwc`。
+- 実行を `ingest_run` に記録（開始/終了/件数）。
 
 ### テスト
 
-- オフライン単体: polyline デコード（Google 公式サンプル）・間引き・
-  スクレイプの所要時間抽出・日本語時間パース。全て CI で実行。
-- `tests/route_live.rs`（`#[ignore]`、手動実行で確認済み）:
-  - GSI 標高: 渋谷→恵比寿の 3 点で 登り 6.1m / 下り 0.4m を取得。
-  - スクレイプ徒歩: 渋谷→恵比寿 900s（15分）、標高 登り16.6m / 下り10.9m。
-  - スクレイプ公共交通: 最速 900s / 最遅 1800s（概算。実用の明細は API 必須）。
+- オフライン単体 8 件（都道府県テーブル、タイル分割、ブランド正規化、
+  価格帯、carrier 推定、Overpass 要素パース、QL 生成）。CI で実行。
+- **実ネットワーク実行で確認**: `ingest overpass --bbox 35.655,139.695,35.670,139.710`
+  （渋谷周辺）→ コンビニ 73 / スーパー 5 / 郵便局 9 / 駅 7 を SQLite に投入。
+  ブランドが `ローソン` `セブン-イレブン` `まいばすけっと` 等に正規化され、
+  price_tier も正しく付与されることを DB ダンプで確認。
+
+### 未実装（次段）
+
+- ブランド公式店舗一覧ページのアダプタ（`poi/brands/`）。トレイト設計のみ記載。
+- 座標欠落店舗の Google Maps 個別補完（`poi/google_fill`）。
+- 駅と路線（`railway_line` / `station_line`）の紐付け。
 
 ### 確認
 
 - `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings` 通過。
-- `cargo test --workspace` green（オフライン 14、live は ignored）。
-- Windows 上で実行。API 経路は鍵が無いため未実行（型・パースは実装済み）。
+- `cargo test --workspace` green（オフライン 22、live は ignored）。Windows 上で実行。
