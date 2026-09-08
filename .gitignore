@@ -9,7 +9,9 @@
 /dist
 node_modules/
 # cargo-leptos build output
-/crates/server/pkg
+/server/pkg
 
 *.log
 poi_done.txt
+
+/web/dist

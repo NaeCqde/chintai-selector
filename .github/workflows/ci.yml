@@ -19,10 +19,15 @@ jobs:
                   override: true
                   profile: minimal
                   components: rustfmt, clippy
+                  target: wasm32-unknown-unknown
             - uses: Swatinem/rust-cache@v2
             - name: fmt
               run: cargo fmt --all --check
-            - name: clippy
-              run: cargo clippy --workspace --all-targets -- -D warnings
+            - name: clippy (native crates)
+              run: cargo clippy --workspace --exclude chintai-web --all-targets -- -D warnings
+            - name: clippy (wasm)
+              run: cargo clippy -p chintai-web --target wasm32-unknown-unknown -- -D warnings
             - name: test
-              run: cargo test --workspace
+              run: cargo test --workspace --exclude chintai-web
+            - name: wasm build
+              run: cargo build -p chintai-web --target wasm32-unknown-unknown

@@ -49,10 +49,7 @@ async fn run() -> anyhow::Result<()> {
     }
 }
 
-async fn overpass_cmd(
-    db: &chintai_db::DatabaseConnection,
-    args: &[String],
-) -> anyhow::Result<()> {
+async fn overpass_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> anyhow::Result<()> {
     let opts = Opts::parse(args);
     let grid = opts.grid.unwrap_or((3, 3));
     let overpass = Overpass::new();

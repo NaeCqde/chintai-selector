@@ -2,64 +2,54 @@
 
 このコミットの内容。次のコミットでまっさらにして書き直す。
 
-## `chintai-server::engine` — フィルタ / ランキングエンジン + `/api/search`
+## フロントエンド（Leptos CSR SPA）+ 型の共有クレート化 + クレート平坦化
 
-### `engine/types.rs`
+### クレート構成の変更
 
-- `SearchRequest { places, filters, ranking, limit }`（すべて serde、後で Leptos
-  サーバー関数境界をそのまま渡せる）。
-  - `PlaceSpec { label, lat, lng, mode(walk/car/transit), max_minutes }`。
-  - `Filters` = 家賃上限 / 面積下限 / 間取り許可リスト / 築年数上限 /
-    コンビニ・スーパーまでの徒歩分上限 / 安い系スーパー必須 / 荷物拠点まで m。
-  - `RankSpec { key, weight, ascending }`。`RankKey` = AccessTotal / AccessWorst /
-    Rent / Area / RentPerArea / NearestSuper / NearestConveni / BuildYear。
-- `SearchResponse { results, considered, matched }`。
-  `RankedProperty` は best_unit / other_units / 各 place の `PlaceAccess`
-  （所要分・上限内か・**フルの `RouteResult`**＝乗換案内表示用）・
-  最寄りコンビニ/スーパー/安い系スーパー/荷物拠点までの距離。
-  `UnitView.sources` に SUUMO/HOME'S のサイト別 URL。
+- `crates/*` を廃止しリポジトリ直下へ（`db/` `scraper/` `server/` `web/` `types/`）。
+- **`types`（`chintai-types`）新設** — serde だけの純データ型で wasm32 でビルド可能。
+  ルート型（`RouteResult` / `Itinerary` / `Leg` / `LatLng` / `Mode` …）、
+  エンジンの入出力（`SearchRequest` / `Filters` / `RankSpec` / `SearchResponse` /
+  `RankedProperty` …）、地図 DTO（`PoiPoint` / `PoiKind` / `Geocoded`）を集約。
+  `scraper` と `server` は再エクスポート、`web` はこれだけに依存。
+  `RouteError`（`reqwest::Error` を包む）は `scraper` に残置。
 
-### `engine/mod.rs` — 処理
+### `web`（`chintai-web`）— Leptos 0.8 CSR
 
-1. `units_with_geocoded_property` を全件ロード → 家賃/面積/間取り/築年で静的フィルタ。
-2. `stores_with_brand` / `deliveries_with_coords` から最寄り POI を直線距離で算出
-   （徒歩 80m/分換算）。POI 徒歩分フィルタで足切り。
-3. 各 place を `route_cached`（`route_cache` 併用、`buffer_unordered(6)` で並行）で計算、
-   全 place が `max_minutes` 以内の物件だけ残す。
-4. 各ランキング指標を 0..1 に正規化 → 重み付き合算 → ソート → 上位 `limit`。
-   ランキング未指定時は AccessTotal(1.0) + Rent(0.5)。
+- `cargo-leptos` は当環境で openssl-sys のためビルド不可 → **CSR + wasm-bindgen-cli**
+  構成。`web/build.sh [--release]` が wasm をビルドして `web/dist/` に出力
+  （`chintai.js` / `chintai_bg.wasm` / `index.html` / `style.css`）。
+- コンポーネント: `PlaceEditor`（目的地の追加・ジオコーディング・移動手段・分数）、
+  `FilterPanel`（家賃/面積/築年/間取りチップ/コンビニ・スーパー徒歩分/安い系必須/荷物m）、
+  `RankingControls`（8 指標の重みスライダー）、`ResultList`/`ResultCard`
+  （順位・家賃・間取り・サイト別リンク・**各 place の乗換案内風明細**＝会社/路線/種別/
+  駅/時刻/停車数/乗換、徒歩の高低差、最速〜最遅レンジ）、`MapPane`。
+- `MapPane` — `index.html` の MapLibre シム（`window.chintaiMap`、OSM ラスタータイル）を
+  `wasm-bindgen` 経由で操作。候補ピン（順位色・選択強調）＋目的地ピン＋選択物件から
+  各目的地への経路線、周辺 POI レイヤ（`/api/pois`）。
+- レスポンシブ: CSS Grid。PC は左パネル＋右地図、〜820px は地図全面＋下部シート。
+- 設定（places / filters / ranking）は `localStorage` に自動保存・復元。
 
-### `engine/geo.rs`
+### `server`
 
-- `haversine_m` / `walk_minutes`（80m/分）。
-
-### `chintai-db`
-
-- 読み取りモデル追加: `units_with_geocoded_property` / `stores_with_brand` /
-  `deliveries_with_coords` / `stations_all` / `listings_for_unit`。
-
-### `chintai-server`
-
-- `POST /api/search`（`SearchRequest` JSON → `SearchResponse` JSON）。
-  起動時に DB 接続＋`route::default_provider`（スクレイプ→鍵があれば API）を構築。
-
-### テスト
-
-- `engine/tests.rs` — インメモリ SQLite に合成データ（近い物件 A・遠い物件 B、
-  コンビニ/安い系スーパー、複数ユニット）＋直線距離モックの `RouteProvider` で:
-  - 時間上限で遠い物件が落ちる / best_unit が最安ユニット / 最寄り POI 距離
-  - 家賃・間取りフィルタ / コンビニ徒歩分フィルタ
-  - Area ランキングで広い物件が 1 位 / route 明細が結果まで伝わる
-  6 ケース green。`geo` の haversine 1 ケース。
+- 静的配信を追加（`ServeDir` + SPA フォールバック、`CHINTAI_WEB_DIR`）。
+- API: `POST /api/search` / `GET /api/pois?bbox=&kinds=` / `GET /api/geocode?q=` /
+  `GET /api/health`。`AppState` に DB・ルートプロバイダ・ジオコーダを保持。
 
 ### 確認
 
-- `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings` 通過。
-- `cargo test --workspace` green（オフライン 37）。
-- **実データ end-to-end**: 世田谷の賃貸 + 周辺 POI(780 店舗/143 拠点/64 駅) を
-  ingest した SQLite に対し `chintai-server` を起動、`POST /api/search`
-  （渋谷勤務・公共交通 40 分以内・家賃 20 万以下）→ HTTP 200。
-  aiflat明大前(1DK ¥145000, 12 ユニット、SUUMO 重複リスティングを名寄せ) 等が
-  順位付きで返り、最寄りコンビニ 204m / スーパー 408m / 荷物拠点 334m、
-  各 place の所要 15 分・route 明細（スクレイプは transit 合計のみ、明細は API 鍵必要）を確認。
-- Windows 上で実行。
+- `cargo fmt --all --check` / `clippy`（native は `-D warnings`、wasm も `-D warnings`）通過。
+- `cargo test --workspace --exclude chintai-web` green（db 6 / scraper 24 / server 6）。
+- `web/build.sh` で wasm ビルド成功。
+- `chintai-server` を `web/dist` + `chintai.sqlite`（東京・神奈川の POI 済み）で起動 →
+  `/` が SPA を返す、`/chintai.js` `/style.css` 200、
+  `/api/pois?bbox=渋谷周辺` → 108 件、`/api/geocode?q=渋谷駅` 200 を確認。
+  ブラウザでの目視確認は全作業完了後にユーザーへ依頼（UI にバグが残る可能性あり）。
+
+### CI
+
+- `.github/workflows/ci.yml` に wasm ターゲット追加、native と wasm を分けて clippy/build。
+
+### 次段（最後）
+
+- 賃貸物件を東京・神奈川全域で **1 秒 1 リクエスト**でゆっくり取得（`ingest rentals`）。

@@ -689,6 +689,47 @@ pub async fn deliveries_with_coords(
         .collect())
 }
 
+/// (south, west, north, east)
+pub type BBox = (f64, f64, f64, f64);
+
+pub async fn stores_in_bbox(
+    db: &DatabaseConnection,
+    b: BBox,
+) -> Result<Vec<(store::Model, brand::Model)>, DbErr> {
+    let rows = store::Entity::find()
+        .filter(store::Column::Lat.between(b.0, b.2))
+        .filter(store::Column::Lng.between(b.1, b.3))
+        .find_also_related(brand::Entity)
+        .all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(s, br)| Some((s, br?)))
+        .collect())
+}
+
+pub async fn deliveries_in_bbox(
+    db: &DatabaseConnection,
+    b: BBox,
+) -> Result<Vec<delivery::Model>, DbErr> {
+    delivery::Entity::find()
+        .filter(delivery::Column::Lat.between(b.0, b.2))
+        .filter(delivery::Column::Lng.between(b.1, b.3))
+        .all(db)
+        .await
+}
+
+pub async fn stations_in_bbox(
+    db: &DatabaseConnection,
+    b: BBox,
+) -> Result<Vec<station::Model>, DbErr> {
+    station::Entity::find()
+        .filter(station::Column::Lat.between(b.0, b.2))
+        .filter(station::Column::Lng.between(b.1, b.3))
+        .all(db)
+        .await
+}
+
 pub async fn stations_all(db: &DatabaseConnection) -> Result<Vec<station::Model>, DbErr> {
     station::Entity::find().all(db).await
 }

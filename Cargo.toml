@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/db", "crates/scraper", "crates/server"]
+members = ["types", "db", "scraper", "server", "web"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,7 @@ repository = "https://github.com/NaeCqde/chintai-selector"
 #   scraper -> may depend on db (it persists what it collects)
 #   server  -> depends on db + scraper
 [workspace.dependencies]
+chintai-types = { path = "types" }
 anyhow = "1"
 thiserror = "2"
 async-trait = "0.1"

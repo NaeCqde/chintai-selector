@@ -289,7 +289,13 @@ impl Overpass {
         let mut total = IngestCounts::default();
         let tiles = prefectures::tiles(pref.bbox, grid.0, grid.1);
         for (i, t) in tiles.iter().enumerate() {
-            log::info!("overpass {} tile {}/{} {:?}", pref.name, i + 1, tiles.len(), t);
+            log::info!(
+                "overpass {} tile {}/{} {:?}",
+                pref.name,
+                i + 1,
+                tiles.len(),
+                t
+            );
             match self.ingest_bbox(db, *t).await {
                 Ok(c) => {
                     log::info!("  +{} pois ({} skipped)", c.total_pois(), c.skipped);
@@ -425,7 +431,9 @@ mod tests {
 
     #[test]
     fn ql_has_all_five_selectors() {
-        let q = Overpass::ql((35.0, 139.0, 36.0, 140.0));
+        let q = Overpass::bbox_ql((35.0, 139.0, 36.0, 140.0));
+        let a = Overpass::area_ql(13);
+        assert!(a.contains("JP-13") && a.contains("area.a"));
         for s in [
             "shop\"=\"convenience",
             "shop\"=\"supermarket",

@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>chintai-selector</title>
+    <link rel="icon" href="data:," />
+    <link
+        rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/4.7.1/maplibre-gl.min.css"
+    />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/4.7.1/maplibre-gl.min.js"></script>
+    <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+    <script>
+        // --- MapLibre shim (window.chintaiMap) ---------------------------
+        window.chintaiMap = (() => {
+            let map = null;
+            let styleReady = false;
+            const markerEls = [];
+            let poiSourceReady = false;
+
+            const OSM_STYLE = {
+                version: 8,
+                sources: {
+                    osm: {
+                        type: "raster",
+                        tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+                        tileSize: 256,
+                        attribution: "© OpenStreetMap contributors",
+                    },
+                },
+                layers: [{ id: "osm", type: "raster", source: "osm" }],
+            };
+
+            function clearMarkers() {
+                while (markerEls.length) markerEls.pop().remove();
+            }
+
+            function ensurePoiLayer() {
+                if (!styleReady) return;
+                if (!map.getSource("pois")) {
+                    map.addSource("pois", {
+                        type: "geojson",
+                        data: { type: "FeatureCollection", features: [] },
+                    });
+                    map.addLayer({
+                        id: "pois",
+                        type: "circle",
+                        source: "pois",
+                        paint: {
+                            "circle-radius": 4,
+                            "circle-stroke-width": 1,
+                            "circle-stroke-color": "#fff",
+                            "circle-color": [
+                                "match",
+                                ["get", "kind"],
+                                "conveni", "#3f7cc4",
+                                "super", "#e08a2e",
+                                "super-cheap", "#d13f3f",
+                                "delivery", "#7a53c9",
+                                "station", "#444",
+                                "#999",
+                            ],
+                        },
+                    });
+                }
+                poiSourceReady = true;
+            }
+
+            return {
+                init(id, lat, lng, zoom) {
+                    if (map) return;
+                    map = new maplibregl.Map({
+                        container: id,
+                        style: OSM_STYLE,
+                        center: [lng, lat],
+                        zoom,
+                    });
+                    map.addControl(new maplibregl.NavigationControl(), "top-right");
+                    map.on("load", () => {
+                        styleReady = true;
+                        ensurePoiLayer();
+                    });
+                },
+                ready() {
+                    return styleReady;
+                },
+                setMarkers(json) {
+                    if (!map) return;
+                    clearMarkers();
+                    let arr;
+                    try { arr = JSON.parse(json); } catch { return; }
+                    for (const m of arr) {
+                        const el = document.createElement("div");
+                        el.className = "mk mk-" + m.kind + (m.selected ? " sel" : "");
+                        if (m.kind === "property") el.textContent = m.rank ?? "";
+                        else if (m.kind === "place") el.textContent = "★";
+                        const mk = new maplibregl.Marker({ element: el })
+                            .setLngLat([m.lng, m.lat])
+                            .setPopup(new maplibregl.Popup({ offset: 12 }).setText(m.label || ""))
+                            .addTo(map);
+                        markerEls.push(mk);
+                    }
+                },
+                setPois(json) {
+                    ensurePoiLayer();
+                    if (!poiSourceReady) return;
+                    let arr;
+                    try { arr = JSON.parse(json); } catch { return; }
+                    map.getSource("pois").setData({
+                        type: "FeatureCollection",
+                        features: arr.map((p) => ({
+                            type: "Feature",
+                            geometry: { type: "Point", coordinates: [p.lng, p.lat] },
+                            properties: { kind: p.kind, label: p.label },
+                        })),
+                    });
+                },
+                setLines(json) {
+                    if (!styleReady) return;
+                    let arr;
+                    try { arr = JSON.parse(json); } catch { return; }
+                    const data = {
+                        type: "FeatureCollection",
+                        features: arr.map((l) => ({
+                            type: "Feature",
+                            geometry: { type: "LineString", coordinates: [l.from, l.to] },
+                            properties: { color: l.color },
+                        })),
+                    };
+                    if (!map.getSource("lines")) {
+                        map.addSource("lines", { type: "geojson", data });
+                        map.addLayer({
+                            id: "lines",
+                            type: "line",
+                            source: "lines",
+                            paint: {
+                                "line-width": 3,
+                                "line-dasharray": [2, 1],
+                                "line-color": ["get", "color"],
+                            },
+                        });
+                    } else {
+                        map.getSource("lines").setData(data);
+                    }
+                },
+                fitTo(json) {
+                    if (!map) return;
+                    let pts;
+                    try { pts = JSON.parse(json); } catch { return; }
+                    if (!pts.length) return;
+                    const b = new maplibregl.LngLatBounds(pts[0], pts[0]);
+                    for (const p of pts) b.extend(p);
+                    map.fitBounds(b, { padding: 60, maxZoom: 15, duration: 400 });
+                },
+                bounds() {
+                    if (!map) return "";
+                    const b = map.getBounds();
+                    return JSON.stringify([b.getSouth(), b.getWest(), b.getNorth(), b.getEast()]);
+                },
+            };
+        })();
+    </script>
+    <script type="module">
+        import init from "/chintai.js";
+        init();
+    </script>
+</body>
+</html>
