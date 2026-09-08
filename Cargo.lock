@@ -336,6 +336,7 @@ name = "chintai-scraper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chintai-db",
  "chrono",
  "env_logger",

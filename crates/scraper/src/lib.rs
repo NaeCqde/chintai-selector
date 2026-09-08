@@ -2,25 +2,23 @@
 //!
 //! Everything here talks to the outside world with `reqwest` only (no browser).
 //! Modules:
-//!   - `geocode`  : building name / address -> { name, address, lat, lng }
-//!   - `route`    : A -> B travel time, walk elevation delta, transit spread
-//!   - `poi`      : nationwide convenience stores / supermarkets / parcel points
-//!   - `rental`   : SUUMO / LIFULL HOME'S listing adapters + de-duplication
+//!   - `http`    : the shared, per-host rate-limited HTTP client
+//!   - `geocode` : building name / address -> { name, address, lat, lng }
+//!   - `route`   : A -> B travel time, walk elevation delta, transit detail  (later)
+//!   - `poi`     : nationwide convenience stores / supermarkets / parcel points (later)
+//!   - `rental`  : SUUMO / LIFULL HOME'S listing adapters + de-duplication     (later)
 //!
 //! It may depend on `chintai-db` to persist what it collects, but never on the
 //! server crate.
 
-/// Shared HTTP client factory: sensible timeouts, gzip, a real User-Agent, and
-/// (later) a polite rate limiter shared across adapters.
-pub fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(concat!(
-            "chintai-selector/",
-            env!("CARGO_PKG_VERSION"),
-            " (+https://github.com/NaeCqde/chintai-selector)"
-        ))
-        .build()
-        .unwrap_or_default()
+pub mod geocode;
+pub mod http;
+
+pub use http::HttpClient;
+
+/// Read `GOOGLE_MAPS_API_KEY` from the environment, if set and non-empty.
+pub fn google_api_key() -> Option<String> {
+    std::env::var("GOOGLE_MAPS_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }

@@ -17,6 +17,7 @@ path = "src/bin/ingest.rs"
 chintai-db = { path = "../db" }
 anyhow.workspace = true
 thiserror.workspace = true
+async-trait.workspace = true
 log.workspace = true
 env_logger.workspace = true
 serde.workspace = true

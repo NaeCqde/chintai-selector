@@ -2,52 +2,39 @@
 
 このコミットの内容。次のコミットでまっさらにして書き直す。
 
-## `chintai-db`: スキーマ + マイグレーション + リポジトリ関数
+## `chintai-scraper`: HTTP 基盤 + ジオコーディング
 
-SQLite 永続化層の中身を実装した。
+### `http.rs` — 共有 HTTP クライアント
 
-### エンティティ（`crates/db/src/entities/`）
+- クレート全体で 1 つの `reqwest::Client`（gzip、UA、タイムアウト）を
+  `HttpClient` で包む。アダプタは `get` / `get_text` / `get_json` だけ使い
+  `reqwest` を直接触らない。
+- ホスト別レートリミッタ内蔵。既定 1.2 秒間隔、`set_host_interval` で個別上書き
+  （Nominatim は 1.1 秒）。`acquire` が次スロットまで `sleep_until` で待つ。
 
-- `enums.rs` — `BrandKind` / `PriceTier` / `StoreSource` / `TravelMode` /
-  `RouteProviderKind` / `ListingSite`。すべて `snake_case` テキスト保存
-  （SQLite ファイルを読みやすく、変種追加で番号がずれない）。
-- `brand` — コンビニ / スーパーのチェーンと価格帯（`name` 一意）。
-- `store` — ブランドに紐づく実店舗。`(source, external_id)` 一意。座標欠落の
-  重複行は後段で近接名寄せ。
-- `delivery` — 物流拠点。店舗受取なら `store_id`、PUDO ロッカー等の非店舗は
-  `store_id` NULL で座標直持ち。`(carrier, external_id)` 一意。
-- `property` / `unit` / `listing` — 建物 / 部屋 / サイト別元データ。
-  `unit` は `(property_id, dedup_key)`、`listing` は `(site, site_listing_id)` 一意。
-- `railway_line` / `station` / `station_line` — 公共交通ルートの会社・路線・
-  駅・駅ランク（`station_line.train_types_json` = その駅に停まる種別）。
-- `route_cache` — 丸めた座標＋モードでキー化。全行程を `result_json` に格納
-  （徒歩の高低差、公共交通の会社/路線/種別/駅/時刻/停車数、最速〜最遅）。UI の
-  乗換案内表示に使う。
-- `ingest_run` — 定期更新の実行記録。
+### `geocode.rs` — 「建物名 / 住所」→ `{ name, address, lat, lng, source }`
 
-### マイグレーション（`m20260908_000001_init`）
+- `trait Geocoder`（`Ok(None)` = 見つからない / `Err` = バックエンド障害→次を試す）。
+- `NominatimGeocoder` — OSM、日本限定・`accept-language=ja`。実運用の主力。
+- `GoogleScrapeGeocoder` — `/maps/place/` HTML から地図中心の
+  `[zoom,lng,lat]` トリプルを抜く best-effort。consent cookie 無しだと汎用地図を
+  返して座標を外すことがあるため **既定では無効**（`default_geocoder` の引数で opt-in）。
+- `GoogleApiGeocoder` — `GOOGLE_MAPS_API_KEY` がある時だけ。
+- `FallbackGeocoder` — 順に試し、日本の緯度経度範囲に収まる最初の結果を返す。
+- `default_geocoder(http, api_key, enable_google_scrape)` で標準チェーンを構築。
 
-- エンティティから `create_table_from_entity` でテーブル生成（型・NULL 可否・
-  単一列 UNIQUE を引き継ぐ）。複合 UNIQUE と検索用インデックスはマクロで明示追加。
-- 親→子の順で作成（外部キー）。
+### テスト
 
-### リポジトリ関数（`crates/db/src/repo.rs`）
-
-- `upsert_brand` / `upsert_store` / `upsert_delivery` / `upsert_property` /
-  `upsert_unit` / `record_listing` / `upsert_railway_line` / `upsert_station` /
-  `upsert_station_line` / `route_cache_get` / `route_cache_put` /
-  `ingest_run_start` / `ingest_run_finish` / `count`。
-- パターンは「`INSERT ... ON CONFLICT DO UPDATE`（原子的）→ 自然キーで `SELECT`
-  し直して行を返す」。`exec_with_returning` は使わない —— SQLite の
-  `last_insert_rowid()` は接続グローバルで、他テーブルへの挿入が挟まると
-  conflict-update が誤った行（または無し）を返すため（実テストで再現・回避を確認）。
-- `connect()` はインメモリ URL を検知して接続プールを 1 に固定
-  （`:memory:` は接続ごとに別 DB になるため）。
+- `geocode.rs` 内: `first_jp_lat_lng` / `read_float` のパーサ単体 4 件（オフライン、CI で実行）。
+- `tests/geocode_live.rs`: Nominatim 実アクセス 2 件。`#[ignore]` なので CI は
+  オフラインのまま。`cargo test -p chintai-scraper --test geocode_live -- --ignored` で実行。
+  - 手動実行して確認済み: 「東京タワー」→ 35.6584/139.7455（実座標 35.6586/139.7454）、
+    住所クエリも東京駅周辺の座標を返す。
+  - Google スクレイプは手動実行で座標を外した（広島付近を返した）ことを確認 →
+    上記のとおり既定無効の判断は妥当。
 
 ### 確認
 
-- `cargo test -p chintai-db` — インメモリ SQLite で 6 ケース green
-  （brand/store/delivery のべき等 upsert、property→unit→listing 連鎖、
-  route_cache の座標丸めキー一致、ingest_run ライフサイクル）。
 - `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -- -D warnings` 通過。
+- `cargo test --workspace` green（db 6 + scraper parser 4、live は ignored）。
 - Windows 上で実行。
