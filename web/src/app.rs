@@ -389,15 +389,31 @@ fn SearchBar() -> impl IntoView {
         });
     };
 
+    let form = state.form;
     view! {
         <div class="search-bar">
             <button class="primary" on:click=run disabled=move || state.loading.get()>
                 {move || if state.loading.get() { "検索中…" } else { "物件を検索" }}
             </button>
+            <label class="checkbox">
+                <input
+                    type="checkbox"
+                    prop:checked=move || form.with(|f| f.refine)
+                    on:change=move |ev| {
+                        let c = event_target_checked(&ev);
+                        form.update(|f| f.refine = c);
+                    }
+                />
+                "上位の経路を正確に取得（乗換案内・数十秒）"
+            </label>
             {move || state.error.get().map(|e| view! { <p class="err">{e}</p> })}
             {move || state.results.get().map(|r| view! {
                 <p class="muted">
-                    {format!("{} 件が条件突破 / {} 件を評価", r.matched, r.considered)}
+                    {format!(
+                        "{} 件が条件突破 / {} 件を評価{}",
+                        r.matched, r.routed.max(r.considered),
+                        if r.capped { "（近い順に上限あり）" } else { "" }
+                    )}
                 </p>
             })}
         </div>
@@ -496,6 +512,7 @@ fn RouteDetail(route: RouteResult) -> impl IntoView {
     let open = RwSignal::new(false);
     let it = route.itineraries.first().cloned();
     let has_detail = it.as_ref().map(|i| !i.legs.is_empty()).unwrap_or(false);
+    let is_est = route.provider.is_estimate();
 
     let spread = match (route.transit_fastest, route.transit_slowest) {
         (Some(f), Some(s)) if f != s => Some(format!(
@@ -517,6 +534,7 @@ fn RouteDetail(route: RouteResult) -> impl IntoView {
                     {move || if open.get() { "▲ 経路" } else { "▼ 経路" }}
                 </button>
             })}
+            {is_est.then(|| view! { <span class="muted"> " 推定"</span> })}
             {spread.map(|s| view! { <span class="muted"> " " {s}</span> })}
             {elev.map(|e| view! { <span class="muted"> " " {e}</span> })}
             {move || (open.get()).then(|| {

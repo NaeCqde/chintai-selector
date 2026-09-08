@@ -178,6 +178,7 @@ async fn time_limit_drops_the_far_property() {
         filters: Filters::default(),
         ranking: vec![],
         limit: 10,
+        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
 
@@ -207,6 +208,7 @@ async fn rent_filter_and_layout_filter() {
         },
         ranking: vec![],
         limit: 10,
+        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
     // Both properties have a sub-90k 1K unit and are within 60 min transit.
@@ -230,6 +232,7 @@ async fn conveni_walk_filter_drops_property_b() {
         },
         ranking: vec![],
         limit: 10,
+        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
     assert_eq!(resp.matched, 1);
@@ -246,6 +249,7 @@ async fn ranking_by_area_puts_bigger_first() {
         filters: Filters::default(),
         ranking: vec![RankSpec::new(RankKey::Area, 1.0)],
         limit: 10,
+        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
     assert_eq!(resp.results[0].name, "近マンション"); // has the 40 m² unit
@@ -262,6 +266,7 @@ async fn route_detail_is_carried_through() {
         filters: Filters::default(),
         ranking: vec![],
         limit: 5,
+        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
     let pa = &resp.results[0].places[0];

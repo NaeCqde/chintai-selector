@@ -126,16 +126,18 @@ pub async fn ingest_area(
             .await?;
             counts.buildings += 1;
 
-            // Approximate coordinates from the nearest scraped station (the
-            // list page has no lat/lng, and Nominatim can't pin a coarse ward
-            // address). Good enough for the ranking engine's routing; a later
-            // `ingest geocode` pass refines what's left.
+            // Approximate coordinates from the nearest scraped station, offset
+            // by the scraped walk time in a stable pseudo-random direction (we
+            // don't know the true bearing). The list page has no lat/lng and
+            // Nominatim can't pin a coarse ward address; a later `ingest
+            // geocode` / detail-page pass refines this.
             if prop.lat.is_none() {
                 for st in &b.stations {
                     if let Ok(Some(station)) = chintai_db::station_by_name(db, &st.station).await {
-                        let _ =
-                            chintai_db::set_property_coords(db, prop.id, station.lat, station.lng)
-                                .await;
+                        let dist_m = st.walk_min.unwrap_or(5).clamp(1, 30) as f64 * 80.0;
+                        let bearing = hash_bearing(&b.name, &b.address);
+                        let (lat, lng) = offset(station.lat, station.lng, dist_m, bearing);
+                        let _ = chintai_db::set_property_coords(db, prop.id, lat, lng).await;
                         break;
                     }
                 }
@@ -183,6 +185,26 @@ pub async fn ingest_area(
     }
 
     Ok(counts)
+}
+
+/// Stable bearing in radians from a building's identity, so the same building
+/// always lands in the same spot around its station.
+fn hash_bearing(name: &str, address: &str) -> f64 {
+    let mut h: u64 = 1469598103934665603;
+    for byte in name.bytes().chain(address.bytes()) {
+        h ^= byte as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    (h % 3600) as f64 / 3600.0 * std::f64::consts::TAU
+}
+
+/// Move `dist_m` from (lat,lng) along `bearing` (radians). Small-distance
+/// equirectangular approximation — fine for a few hundred metres.
+fn offset(lat: f64, lng: f64, dist_m: f64, bearing: f64) -> (f64, f64) {
+    const M_PER_DEG_LAT: f64 = 111_320.0;
+    let dlat = dist_m * bearing.cos() / M_PER_DEG_LAT;
+    let dlng = dist_m * bearing.sin() / (M_PER_DEG_LAT * lat.to_radians().cos());
+    (lat + dlat, lng + dlng)
 }
 
 /// Current calendar year (for "築N年" → build year). Cheap approximation from

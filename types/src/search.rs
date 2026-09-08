@@ -80,6 +80,11 @@ pub struct SearchRequest {
     pub ranking: Vec<RankSpec>,
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Fetch accurate routes + transfer guidance for the top results (needs a
+    /// network round-trip each; the first uncached search takes ~10-20s).
+    /// `false` = fast estimate only.
+    #[serde(default)]
+    pub refine: bool,
 }
 
 fn default_limit() -> u32 {
@@ -91,8 +96,18 @@ fn default_limit() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub results: Vec<RankedProperty>,
-    /// How many properties passed the static filters before routing.
+    /// How many properties passed the static + POI filters.
     pub considered: usize,
+    /// Of those, how many were close enough (crow-flies) to be worth routing.
+    #[serde(default)]
+    pub plausible: usize,
+    /// How many were actually routed (capped for latency).
+    #[serde(default)]
+    pub routed: usize,
+    /// True when `plausible` exceeded the routing cap, so some candidates
+    /// further out were not evaluated.
+    #[serde(default)]
+    pub capped: bool,
     /// How many survived every place's time limit.
     pub matched: usize,
 }

@@ -19,19 +19,47 @@ use std::collections::HashMap;
 
 use chintai_db::entities::enums::PriceTier;
 use chintai_db::{entities, DatabaseConnection};
-use chintai_scraper::route::{route_cached, LatLng, RouteProvider};
+use chintai_scraper::route::{route_cached, EstimateProvider, LatLng, RouteProvider};
 use futures::stream::{self, StreamExt};
 
 use geo::{haversine_m, walk_minutes};
 
-/// How many route lookups to run concurrently. The scraper's per-host rate
-/// limiter still paces the actual requests; this just overlaps the waiting.
-const ROUTE_CONCURRENCY: usize = 6;
+/// Never route more than this many candidates in one search — keeps latency
+/// bounded when a loose filter leaves hundreds of buildings. The closest ones
+/// (crow-flies) are kept.
+const ROUTE_CAP: usize = 60;
+
+/// Optimistic door-to-door speed as metres per minute — a candidate further
+/// than `minutes * this` from a place cannot possibly reach it in time, so it
+/// is dropped before routing.
+fn reachable_ceiling_m(mode: chintai_scraper::route::Mode, minutes: u32) -> f64 {
+    use chintai_scraper::route::Mode;
+    let per_min = match mode {
+        Mode::Walk => 100.0,    // ~6 km/h
+        Mode::Car => 1_000.0,   // ~60 km/h
+        Mode::Transit => 900.0, // ~54 km/h incl. access/wait, generous
+    };
+    minutes as f64 * per_min + 400.0 // + slack for the last-leg walk
+}
+
+fn straight_line_sum(c: &Candidate, places: &[PlaceSpec]) -> f64 {
+    let (lat, lng) = (c.prop.lat.unwrap(), c.prop.lng.unwrap());
+    places
+        .iter()
+        .map(|p| haversine_m(lat, lng, p.lat, p.lng))
+        .sum()
+}
 
 pub struct Engine<'a> {
     pub db: &'a DatabaseConnection,
+    /// The accurate provider (Google scrape → API). Used to refine the top
+    /// results after the fast estimate pass ranks everything.
     pub provider: &'a dyn RouteProvider,
 }
+
+/// Top-N results that get a real (networked) route + transfer detail after the
+/// estimate pass. Kept small so a keyless search stays interactive.
+const REFINE_CAP: usize = 12;
 
 impl<'a> Engine<'a> {
     pub fn new(db: &'a DatabaseConnection, provider: &'a dyn RouteProvider) -> Self {
@@ -106,24 +134,41 @@ impl<'a> Engine<'a> {
         }
         let considered = candidates.len();
 
-        // --- 2. route every candidate against every place ---------------
-        let routed: Vec<RoutedCandidate> =
-            stream::iter(candidates.into_iter().map(|c| async move {
+        // --- 1b. straight-line pre-filter ------------------------------------
+        // Routing is the expensive step (a scrape / API call per candidate x
+        // place). Drop anything that physically cannot reach a place inside its
+        // limit even at an optimistic speed, then route only the closest
+        // `ROUTE_CAP` by summed crow-flies distance.
+        candidates.retain(|c| {
+            let (plat, plng) = (c.prop.lat.unwrap(), c.prop.lng.unwrap());
+            req.places.iter().all(|place| {
+                haversine_m(plat, plng, place.lat, place.lng)
+                    <= reachable_ceiling_m(place.mode, place.max_minutes)
+            })
+        });
+        candidates.sort_by(|a, b| {
+            straight_line_sum(a, &req.places)
+                .partial_cmp(&straight_line_sum(b, &req.places))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let plausible = candidates.len();
+        candidates.truncate(ROUTE_CAP);
+        let capped = plausible > candidates.len();
+
+        // --- 2. estimate-route every candidate (instant, no network) -------
+        let estimator = EstimateProvider;
+        let routed: Vec<RoutedCandidate> = stream::iter(candidates.into_iter().map(|c| {
+            let estimator = &estimator;
+            async move {
                 let origin = LatLng::new(c.prop.lat.unwrap(), c.prop.lng.unwrap());
                 let mut places = Vec::with_capacity(req.places.len());
                 let mut all_ok = true;
                 for place in &req.places {
                     let dest = LatLng::new(place.lat, place.lng);
-                    let route = match route_cached(self.db, self.provider, origin, dest, place.mode)
+                    let route = estimator
+                        .route(origin, dest, place.mode)
                         .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            log::warn!("route {} -> {}: {e}", c.prop.name, place.label);
-                            all_ok = false;
-                            break;
-                        }
-                    };
+                        .expect("estimate is infallible");
                     let minutes = (route.duration.as_secs() as f64 / 60.0).ceil() as u32;
                     let within = minutes <= place.max_minutes;
                     all_ok &= within;
@@ -135,12 +180,14 @@ impl<'a> Engine<'a> {
                     });
                 }
                 all_ok.then_some(RoutedCandidate { c, places })
-            }))
-            .buffer_unordered(ROUTE_CONCURRENCY)
-            .filter_map(|x| async move { x })
-            .collect()
-            .await;
+            }
+        }))
+        .buffer_unordered(64)
+        .filter_map(|x| async move { x })
+        .collect()
+        .await;
 
+        let routed_count = plausible.min(ROUTE_CAP);
         let matched = routed.len();
 
         // --- 3. score + sort ------------------------------------------------
@@ -161,6 +208,26 @@ impl<'a> Engine<'a> {
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(req.limit as usize);
 
+        // --- 3b. optionally refine the top few with the real provider -----
+        // (accurate times + transfer detail). Bounded so a keyless search
+        // stays interactive; the rest keep their estimate.
+        for (_, rc, _) in scored
+            .iter_mut()
+            .take(if req.refine { REFINE_CAP } else { 0 })
+        {
+            let origin = LatLng::new(rc.c.prop.lat.unwrap(), rc.c.prop.lng.unwrap());
+            for (pa, place) in rc.places.iter_mut().zip(&req.places) {
+                let dest = LatLng::new(place.lat, place.lng);
+                if let Ok(real) =
+                    route_cached(self.db, self.provider, origin, dest, place.mode).await
+                {
+                    pa.minutes = (real.duration.as_secs() as f64 / 60.0).ceil() as u32;
+                    pa.within_limit = pa.minutes <= place.max_minutes;
+                    pa.route = real;
+                }
+            }
+        }
+
         // --- 4. materialise ------------------------------------------------
         let mut results = Vec::with_capacity(scored.len());
         for (i, (score, rc, _)) in scored.into_iter().enumerate() {
@@ -170,6 +237,9 @@ impl<'a> Engine<'a> {
         Ok(SearchResponse {
             results,
             considered,
+            plausible,
+            routed: routed_count,
+            capped,
             matched,
         })
     }

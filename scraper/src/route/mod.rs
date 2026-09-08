@@ -16,6 +16,7 @@
 
 mod api;
 mod elevation;
+mod estimate;
 mod fallback;
 mod polyline;
 mod scrape;
@@ -23,6 +24,7 @@ mod types;
 
 pub use api::GoogleRoutesApi;
 pub use elevation::GsiElevation;
+pub use estimate::EstimateProvider;
 pub use fallback::FallbackProvider;
 pub use scrape::GoogleMapsScrape;
 pub use types::*;
@@ -77,6 +79,11 @@ pub async fn route_cached(
 
     let result = provider.route(from, to, mode).await?;
 
+    // Instant estimates aren't worth a row (and would evict a real result).
+    if result.provider.is_estimate() {
+        return Ok(result);
+    }
+
     let value = RouteCacheValue {
         duration_sec: result.duration.as_secs() as i32,
         transit_fastest_sec: result.transit_fastest.map(|d| d.as_secs() as i32),
@@ -105,6 +112,7 @@ fn mode_to_db(m: Mode) -> TravelMode {
 
 fn provider_to_db(p: ProviderKind) -> RouteProviderKind {
     match p {
+        ProviderKind::Estimate => RouteProviderKind::Estimate,
         ProviderKind::GoogleScrape => RouteProviderKind::GoogleScrape,
         ProviderKind::GoogleApi => RouteProviderKind::GoogleApi,
     }

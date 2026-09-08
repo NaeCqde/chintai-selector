@@ -71,6 +71,8 @@ pub struct FormModel {
     pub filters: Filters,
     pub ranking: Vec<RankRow>,
     pub limit: u32,
+    #[serde(default)]
+    pub refine: bool,
 }
 
 impl Default for FormModel {
@@ -80,6 +82,7 @@ impl Default for FormModel {
             filters: Filters::default(),
             ranking: default_ranking(),
             limit: 50,
+            refine: false,
         }
     }
 }
@@ -127,6 +130,7 @@ impl FormModel {
             filters: self.filters.clone(),
             ranking,
             limit: self.limit.max(1),
+            refine: self.refine,
         })
     }
 }

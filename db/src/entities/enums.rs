@@ -42,6 +42,7 @@ pub enum TravelMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
 #[sea_orm(rs_type = "String", db_type = "Text", rename_all = "snake_case")]
 pub enum RouteProviderKind {
+    Estimate,
     GoogleScrape,
     GoogleApi,
 }
