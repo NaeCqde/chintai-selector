@@ -64,7 +64,7 @@ pub async fn route_cached(
         from_lng: from.lng,
         to_lat: to.lat,
         to_lng: to.lng,
-        mode: mode.into(),
+        mode: mode_to_db(mode),
     };
 
     if let Ok(Some(row)) = chintai_db::route_cache_get(db, &key).await {
@@ -83,7 +83,7 @@ pub async fn route_cached(
         transit_slowest_sec: result.transit_slowest.map(|d| d.as_secs() as i32),
         walk_ascent_m: result.walk_ascent_m,
         walk_descent_m: result.walk_descent_m,
-        provider: result.provider.into(),
+        provider: provider_to_db(result.provider),
         result_json: serde_json::to_string(&result).ok(),
     };
     if let Err(e) = chintai_db::route_cache_put(db, &key, value).await {
@@ -92,21 +92,20 @@ pub async fn route_cached(
     Ok(result)
 }
 
-impl From<Mode> for TravelMode {
-    fn from(m: Mode) -> Self {
-        match m {
-            Mode::Walk => TravelMode::Walk,
-            Mode::Car => TravelMode::Car,
-            Mode::Transit => TravelMode::Transit,
-        }
+// `Mode` / `ProviderKind` are chintai-types and `TravelMode` /
+// `RouteProviderKind` are chintai-db, so the orphan rule rules out `From`
+// impls — plain functions instead.
+fn mode_to_db(m: Mode) -> TravelMode {
+    match m {
+        Mode::Walk => TravelMode::Walk,
+        Mode::Car => TravelMode::Car,
+        Mode::Transit => TravelMode::Transit,
     }
 }
 
-impl From<ProviderKind> for RouteProviderKind {
-    fn from(p: ProviderKind) -> Self {
-        match p {
-            ProviderKind::GoogleScrape => RouteProviderKind::GoogleScrape,
-            ProviderKind::GoogleApi => RouteProviderKind::GoogleApi,
-        }
+fn provider_to_db(p: ProviderKind) -> RouteProviderKind {
+    match p {
+        ProviderKind::GoogleScrape => RouteProviderKind::GoogleScrape,
+        ProviderKind::GoogleApi => RouteProviderKind::GoogleApi,
     }
 }

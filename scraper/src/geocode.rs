@@ -8,15 +8,7 @@
 
 use crate::http::{HttpClient, HttpError};
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Geocoded {
-    pub name: String,
-    pub address: String,
-    pub lat: f64,
-    pub lng: f64,
-    /// Which backend produced this ("nominatim" / "google_scrape" / "google_api").
-    pub source: String,
-}
+pub use chintai_types::Geocoded;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GeocodeError {

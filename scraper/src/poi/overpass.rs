@@ -71,8 +71,8 @@ impl Overpass {
     /// (`[timeout:180]` in the QL).
     pub fn new() -> Self {
         let http = HttpClient::slow(
-            std::time::Duration::from_secs(4),
-            std::time::Duration::from_secs(210),
+            std::time::Duration::from_secs(12),
+            std::time::Duration::from_secs(660),
         );
         for host in [
             "overpass-api.de",
@@ -80,44 +80,75 @@ impl Overpass {
             "overpass.openstreetmap.fr",
             "overpass.private.coffee",
         ] {
-            http.set_host_interval(host, std::time::Duration::from_secs(4));
+            http.set_host_interval(host, std::time::Duration::from_secs(12));
         }
         Self { http }
     }
 
-    fn ql(bbox: BBox) -> String {
+    /// The five selectors we want, restricted to `region` (either
+    /// `({s},{w},{n},{e})` or `(area.a)`).
+    fn selectors(region: &str) -> String {
+        format!(
+            "(\
+               nwr[\"shop\"=\"convenience\"]{region};\
+               nwr[\"shop\"=\"supermarket\"]{region};\
+               nwr[\"amenity\"=\"parcel_locker\"]{region};\
+               nwr[\"amenity\"=\"post_office\"]{region};\
+               nwr[\"railway\"=\"station\"]{region};\
+             );out center tags;"
+        )
+    }
+
+    fn bbox_ql(bbox: BBox) -> String {
         let (s, w, n, e) = bbox;
         format!(
-            "[out:json][timeout:180];\
-             (\
-               nwr[\"shop\"=\"convenience\"]({s},{w},{n},{e});\
-               nwr[\"shop\"=\"supermarket\"]({s},{w},{n},{e});\
-               nwr[\"amenity\"=\"parcel_locker\"]({s},{w},{n},{e});\
-               nwr[\"amenity\"=\"post_office\"]({s},{w},{n},{e});\
-               nwr[\"railway\"=\"station\"]({s},{w},{n},{e});\
-             );\
-             out center tags;"
+            "[out:json][timeout:240];{}",
+            Self::selectors(&format!("({s},{w},{n},{e})"))
+        )
+    }
+
+    /// One query for a whole prefecture, resolved by its `ISO3166-2` code
+    /// (`JP-13` …) at `admin_level=4` — name matching is unreliable for some
+    /// prefectures (東京都). Server-side this runs for a minute or two.
+    fn area_ql(code: u32) -> String {
+        format!(
+            "[out:json][timeout:600];\
+             area[\"ISO3166-2\"=\"JP-{code:02}\"][\"admin_level\"=\"4\"]->.a;{}",
+            Self::selectors("(area.a)")
         )
     }
 
     pub async fn fetch(&self, bbox: BBox) -> Result<Vec<Element>, OverpassError> {
-        let ql = Self::ql(bbox);
+        self.fetch_ql(&Self::bbox_ql(bbox)).await
+    }
+
+    async fn fetch_area(&self, code: u32) -> Result<Vec<Element>, OverpassError> {
+        self.fetch_ql(&Self::area_ql(code)).await
+    }
+
+    /// Run one OverpassQL query, trying every mirror; on a full sweep of
+    /// failures wait and retry up to 3 times (429/504 under load are common).
+    async fn fetch_ql(&self, ql: &str) -> Result<Vec<Element>, OverpassError> {
         let mut last: Option<HttpError> = None;
-        for (i, endpoint) in ENDPOINTS.iter().enumerate() {
-            match self
-                .http
-                .get_json::<OverpassResponse>(endpoint, &[("data", &ql)])
-                .await
-            {
-                Ok(resp) => return Ok(resp.elements),
-                Err(e) => {
-                    log::warn!(
-                        "overpass {endpoint} failed ({e}); {} mirror(s) left",
-                        ENDPOINTS.len() - i - 1
-                    );
-                    last = Some(e);
+        for attempt in 0..3 {
+            for (i, endpoint) in ENDPOINTS.iter().enumerate() {
+                match self
+                    .http
+                    .get_json::<OverpassResponse>(endpoint, &[("data", ql)])
+                    .await
+                {
+                    Ok(resp) => return Ok(resp.elements),
+                    Err(e) => {
+                        log::warn!(
+                            "overpass {endpoint} failed ({e}); {} mirror(s) left, attempt {}",
+                            ENDPOINTS.len() - i - 1,
+                            attempt + 1
+                        );
+                        last = Some(e);
+                    }
                 }
             }
+            tokio::time::sleep(std::time::Duration::from_secs(30 * (attempt + 1))).await;
         }
         Err(OverpassError::Http(last.unwrap_or(HttpError::BadUrl(
             "no overpass endpoint".into(),
@@ -131,9 +162,17 @@ impl Overpass {
         bbox: BBox,
     ) -> Result<IngestCounts, OverpassError> {
         let elements = self.fetch(bbox).await?;
+        self.ingest_elements(db, &elements).await
+    }
+
+    async fn ingest_elements(
+        &self,
+        db: &DatabaseConnection,
+        elements: &[Element],
+    ) -> Result<IngestCounts, OverpassError> {
         let mut counts = IngestCounts::default();
 
-        for el in &elements {
+        for el in elements {
             let Some((lat, lng)) = el.coord() else {
                 counts.skipped += 1;
                 continue;
@@ -220,8 +259,9 @@ impl Overpass {
         Ok(counts)
     }
 
-    /// Ingest a whole prefecture by code (1–47), tiling the bbox to stay under
-    /// the Overpass timeout.
+    /// Ingest a whole prefecture by code (1–47). Tries a single `area` query
+    /// first (one request, complete coverage); if that fails on every mirror,
+    /// falls back to `grid`-tiled bbox queries.
     pub async fn ingest_prefecture(
         &self,
         db: &DatabaseConnection,
@@ -231,16 +271,25 @@ impl Overpass {
         let Some(pref) = prefectures::by_code(code) else {
             return Ok(IngestCounts::default());
         };
+
+        log::info!("overpass {}: area query…", pref.name);
+        match self.fetch_area(code).await {
+            Ok(elements) => {
+                log::info!("overpass {}: {} elements", pref.name, elements.len());
+                return self.ingest_elements(db, &elements).await;
+            }
+            Err(e) => log::warn!(
+                "overpass {}: area query failed ({e}); falling back to {}x{} tiles",
+                pref.name,
+                grid.0,
+                grid.1
+            ),
+        }
+
         let mut total = IngestCounts::default();
         let tiles = prefectures::tiles(pref.bbox, grid.0, grid.1);
         for (i, t) in tiles.iter().enumerate() {
-            log::info!(
-                "overpass {} tile {}/{} {:?}",
-                pref.name,
-                i + 1,
-                tiles.len(),
-                t
-            );
+            log::info!("overpass {} tile {}/{} {:?}", pref.name, i + 1, tiles.len(), t);
             match self.ingest_bbox(db, *t).await {
                 Ok(c) => {
                     log::info!("  +{} pois ({} skipped)", c.total_pois(), c.skipped);
