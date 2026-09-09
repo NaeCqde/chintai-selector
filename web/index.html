@@ -34,6 +34,27 @@
                 layers: [{ id: "osm", type: "raster", source: "osm" }],
             };
 
+            // 国土地理院「重ねるハザードマップ」の公開XYZタイル（鍵不要）。
+            // 土砂災害は急傾斜地/土石流/地すべりの3レイヤーを1トグルでまとめて出す。
+            const HAZARD_ATTR =
+                '<a href="https://disaportal.gsi.go.jp/" target="_blank">ハザードマップポータルサイト</a>（国土地理院）';
+            const HAZARD_LAYERS = {
+                flood: [
+                    { id: "hz-flood", path: "01_flood_l2_shinsuishin_data" },
+                ],
+                sediment: [
+                    { id: "hz-sed-debris", path: "05_dosekiryukeikaikuiki" },
+                    { id: "hz-sed-steep", path: "05_kyukeishakeikaikuiki" },
+                    { id: "hz-sed-slide", path: "05_jisuberikeikaikuiki" },
+                ],
+                tsunami: [
+                    { id: "hz-tsunami", path: "04_tsunami_newlegend_data" },
+                ],
+                hightide: [
+                    { id: "hz-hightide", path: "03_hightide_l2_shinsuishin_data" },
+                ],
+            };
+
             function clearMarkers() {
                 while (markerEls.length) markerEls.pop().remove();
             }
@@ -67,6 +88,30 @@
                     });
                 }
                 poiSourceReady = true;
+            }
+
+            function ensureHazardLayer(id, path) {
+                if (map.getSource(id)) return;
+                map.addSource(id, {
+                    type: "raster",
+                    tiles: [`https://disaportaldata.gsi.go.jp/raster/${path}/{z}/{x}/{y}.png`],
+                    tileSize: 256,
+                    minzoom: 2,
+                    maxzoom: 17,
+                    attribution: HAZARD_ATTR,
+                });
+                // Under the POI dots / route lines, above the base map.
+                const before = map.getLayer("pois") ? "pois" : undefined;
+                map.addLayer(
+                    {
+                        id,
+                        type: "raster",
+                        source: id,
+                        layout: { visibility: "none" },
+                        paint: { "raster-opacity": 0.6 },
+                    },
+                    before,
+                );
             }
 
             return {
@@ -159,6 +204,15 @@
                     if (!map) return "";
                     const b = map.getBounds();
                     return JSON.stringify([b.getSouth(), b.getWest(), b.getNorth(), b.getEast()]);
+                },
+                setHazard(kind, visible) {
+                    if (!styleReady) return;
+                    const layers = HAZARD_LAYERS[kind];
+                    if (!layers) return;
+                    for (const { id, path } of layers) {
+                        ensureHazardLayer(id, path);
+                        map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
+                    }
                 },
             };
         })();

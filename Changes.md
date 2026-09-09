@@ -2,58 +2,37 @@
 
 このコミットの内容。次のコミットでまっさらにして書き直す。
 
-## 所要時間データの異常値監査
+## 地図にハザードマップ重ね合わせ機能を追加
 
-現時点でGoogle Mapsから取得済みの駅までの所要時間（1,977件時点）を全件クエリで確認。
-**「徒歩2時間」のような異常値は皆無**：
+国土地理院「重ねるハザードマップ」の公開XYZタイル（`disaportaldata.gsi.go.jp`、鍵不要）を
+MapLibre のラスターレイヤーとして追加。地図左上に4種類のチェックボックスを表示:
 
-| 所要時間 | 件数 |
-|---|---|
-| 0-15分 | 1041 |
-| 15-30分 | 740 |
-| 30-45分 | 72 |
-| 45-60分 | 7 |
-| 60分以上 | **0件** |
+- 洪水浸水想定（`01_flood_l2_shinsuishin_data`、想定最大規模）
+- 土砂災害警戒区域（`05_dosekiryukeikaikuiki`急傾斜地／`05_kyukeishakeikaikuiki`土石流／
+  `05_jisuberikeikaikuiki`地すべりの3レイヤーを1トグルでまとめて表示・非表示）
+- 津波浸水想定（`04_tsunami_newlegend_data`）
+- 高潮浸水想定（`03_hightide_l2_shinsuishin_data`）
 
-最大は48分（jtテラスハウス扇大橋弐番館→扇大橋駅、3447m）。距離と時間から逆算した
-歩行速度は上位20件で一貫して69〜72m/分（Google基準の80m/分よりやや保守的だが、
-実際の道なり距離を反映しており異常ではない）。処理は現在足立区周辺のため、今後
-広い範囲が入るとさらに分布は変わる見込み。バックグラウンドの `google-stations` は継続稼働中。
+各パスは実際にタイルを取得して確認済み（箱根＝土砂災害、鎌倉沿岸＝津波/高潮、
+江戸川区＝洪水、いずれも該当ハザードのあるタイルで200を確認）。
 
-## アットホーム（athome.co.jp）を賃貸データ源に追加
-
-`scraper::rental::Athome`。`.property-card` per 建物、`.room-info-section` per 部屋。
-`tokyo/setagaya-city` 形式（HOME'S と同じ規約）。非ブラウザUAで動作確認。
-
-実装中に**実データで2件のバグを発見・修正**（トリミングした実HTMLフィクスチャで
-`cargo test` に固定化済み）:
-- `.info-item--type` は `<br>` で区切られた**2つの別テキストノード**
-  （"賃貸マンション 3階建" と "2022年3月(築4年7ヶ月)"）。素朴に結合→
-  空白分割すると2つがくっつき、`built_year` が `32026`（"3階建"の"3"+"2026"）
-  のような値になっていた → ノード単位で取得するよう修正。
-- 駅名が `「千歳烏山」駅` のようにアットホーム独自の鉤括弧付き表記
-  （SUUMO/HOME'S の `line/station 歩N分` とは別形式）→ 括弧を剥がして
-  `station_by_name` が引ける形（例: `千歳烏山駅`）にする専用パーサを追加。
-  これを直さないと `ingest google-stations` が一件も解決できなかった。
-- 部屋番号（"２０４"等）から階を復元（AtHomeは階を別フィールドで出さない）。
-
-`ingest rentals --athome <area>` / `scripts/crawl_rentals.sh` にも組み込み。
-
-### ⚠️ 実機確認の状況（正直な報告）
-
-- 初回の実リクエストは成功し、実データ8棟をフィクスチャに保存・パース確認済み。
-- その後の**手動での連続テスト（短時間に約10リクエスト）でアットホームのBot対策
-  （パズル認証ページ）を踏んでしまい、テスト元IPが一時ブロックされた**
-  （UAを変えても同じ、IP起因）。2分以上空けても解除されず、現状はまだブロック中。
-- 実装した `ingest rentals --athome` 自体は1リクエスト/秒程度のペースで動くため、
-  通常はこの手動連投とは異なる挙動になるはずだが、**継続稼働で同じ防御が再度
-  作動する可能性は否定できない**。全件0棟が続くようなら、この防御によるものと判断してほしい。
+- `index.html` の MapLibre シムに `setHazard(kind, visible)` を追加。
+  レイヤーは初回トグル時に遅延生成、不透明度0.6、POIドット・経路線より下・
+  ベース地図より上に挿入（`beforeId: "pois"`）。
+- `web/src/maplibre.rs` に `set_hazard` バインディングを追加。
+- `web/src/app.rs` に `HazardPanel` コンポーネント（4チェックボックス＋出典表示
+  「ハザードマップポータルサイト（国土地理院）」リンク）を追加し、地図左上に配置。
+  トグル状態はセッション内のみ（他の検索条件と違い localStorage には保存しない）。
 
 ## 確認
 
-- `cargo fmt --all --check` / `cargo clippy --workspace --exclude chintai-web --all-targets -- -D warnings` 通過。
-- `cargo test -p chintai-scraper --lib`: **29/29** green（athome 3件含む、新規）。
-- `cargo test -p chintai-db -p chintai-server`: 6+6 green。
-- `cargo test --workspace`（bin込みフル）は実行中の `google-stations` バックグラウンド
-  プロセスが `ingest.exe` をロックしているため今回未実施（ロジックはlibテスト・
-  clippy・手動DB検証で担保）。
+- `cargo build -p chintai-web --target wasm32-unknown-unknown` / `clippy -D warnings` 通過。
+- 埋め込みJSを `node --check` で構文検証。
+- `web/build.sh --release` → `web/dist` に反映確認（index.html/style.css/chintai.js すべてに
+  ハザード関連の内容が含まれることを確認）。
+- `chintai-server` を起動し `/` `/style.css` の配信を確認（ブラウザでの見た目は未確認）。
+- `cargo test -p chintai-db -p chintai-server` 引き続き green（回帰なし）。
+
+## バックグラウンド継続中
+
+- `google-stations`（駅までの実所要時間取得）: 継続稼働中。

@@ -36,4 +36,11 @@ extern "C" {
     /// True once the style has loaded.
     #[wasm_bindgen(js_namespace = chintaiMap, js_name = ready)]
     pub fn ready() -> bool;
+
+    /// Show/hide a 国土地理院 hazard-map overlay. `kind` is one of "flood",
+    /// "sediment" (急傾斜地/土石流/地すべり combined), "tsunami", "hightide".
+    /// Layers are added lazily on first use, semi-transparent, under the POI
+    /// dots and route lines.
+    #[wasm_bindgen(js_namespace = chintaiMap, js_name = setHazard)]
+    pub fn set_hazard(kind: &str, visible: bool);
 }

@@ -29,6 +29,7 @@ pub fn App() -> impl IntoView {
             </aside>
             <main class="map-pane">
                 <MapPane/>
+                <HazardPanel/>
             </main>
         </div>
     }
@@ -683,5 +684,57 @@ fn poi_kind(k: PoiKind) -> &'static str {
         PoiKind::CheapSupermarket => "super-cheap",
         PoiKind::Delivery => "delivery",
         PoiKind::Station => "station",
+    }
+}
+
+// --------------------------------------------------------------------------
+
+/// The four categories the 国交省ハザードマップポータル treats as its default
+/// set. "土砂災害" bundles 急傾斜地崩壊/土石流/地すべり behind one checkbox —
+/// the shim adds/toggles all three GSI raster layers together.
+const HAZARD_KINDS: &[(&str, &str)] = &[
+    ("flood", "洪水浸水想定"),
+    ("sediment", "土砂災害警戒区域"),
+    ("tsunami", "津波浸水想定"),
+    ("hightide", "高潮浸水想定"),
+];
+
+#[component]
+fn HazardPanel() -> impl IntoView {
+    let on: RwSignal<std::collections::HashSet<&'static str>> =
+        RwSignal::new(std::collections::HashSet::new());
+
+    let toggle = move |kind: &'static str| {
+        let now_on = on.with(|s| !s.contains(kind));
+        on.update(|s| {
+            if now_on {
+                s.insert(kind);
+            } else {
+                s.remove(kind);
+            }
+        });
+        maplibre::set_hazard(kind, now_on);
+    };
+
+    view! {
+        <div class="hazard-panel">
+            <p class="hazard-title">"ハザードマップ"</p>
+            {HAZARD_KINDS.iter().map(|&(kind, label)| view! {
+                <label class="checkbox tight">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || on.with(|s| s.contains(kind))
+                        on:change=move |_| toggle(kind)
+                    />
+                    {label}
+                </label>
+            }).collect_view()}
+            <p class="hazard-attr">
+                <a href="https://disaportal.gsi.go.jp/" target="_blank" rel="noreferrer">
+                    "ハザードマップポータルサイト"
+                </a>
+                "（国土地理院）"
+            </p>
+        </div>
     }
 }
