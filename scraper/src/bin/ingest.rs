@@ -255,7 +255,10 @@ async fn backfill_station_names_cmd(
         .unwrap_or(5_000u64);
 
     let pending = chintai_db::properties_without_station_name(db, limit).await?;
-    log::info!("backfill-station-names: {} properties pending", pending.len());
+    log::info!(
+        "backfill-station-names: {} properties pending",
+        pending.len()
+    );
     let (mut found, mut empty) = (0u64, 0u64);
 
     for p in &pending {
