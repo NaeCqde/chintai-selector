@@ -319,8 +319,13 @@ async fn pickup_transit_combines_precomputed_car_leg_with_live_transit() {
     // MockProvider's car speed, so if this leg were computed live instead of
     // read from the DB, the duration assertion below would fail).
     chintai_db::set_property_station_time(
-        &db, a.id, /*walk_min*/ 12, /*distance_m*/ Some(900.0),
-        /*car_min*/ Some(3), /*station_lat*/ 35.6700, /*station_lng*/ 139.7100,
+        &db,
+        a.id,
+        /*walk_min*/ 12,
+        /*distance_m*/ Some(900.0),
+        /*car_min*/ Some(3),
+        /*station_lat*/ 35.6700,
+        /*station_lng*/ 139.7100,
     )
     .await
     .unwrap();

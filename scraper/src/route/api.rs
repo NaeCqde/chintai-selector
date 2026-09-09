@@ -232,7 +232,9 @@ fn next_departure_rfc3339(d: DepartureTime) -> String {
     if candidate <= now_jst {
         candidate += ChronoDuration::days(1);
     }
-    candidate.with_timezone(&Utc).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    candidate
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// "2026-09-08T09:41:00Z" / with offset -> "09:41". Best effort.

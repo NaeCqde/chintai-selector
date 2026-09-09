@@ -2,7 +2,9 @@
 //!
 //!   cargo test -p chintai-scraper --test route_live -- --ignored --nocapture
 
-use chintai_scraper::route::{DepartureTime, GoogleMapsScrape, GsiElevation, LatLng, Mode, RouteProvider};
+use chintai_scraper::route::{
+    DepartureTime, GoogleMapsScrape, GsiElevation, LatLng, Mode, RouteProvider,
+};
 use chintai_scraper::HttpClient;
 
 // 渋谷駅 -> 恵比寿駅 あたり（歩くと坂がある）。

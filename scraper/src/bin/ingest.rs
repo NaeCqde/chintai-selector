@@ -352,7 +352,9 @@ async fn google_stations_cmd(
         car_backfill.len()
     );
     for p in &car_backfill {
-        let Some(name) = &p.station_name else { continue };
+        let Some(name) = &p.station_name else {
+            continue;
+        };
         let Some(station) = chintai_db::station_by_name(db, name).await? else {
             continue;
         };
