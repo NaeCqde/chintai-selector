@@ -18,6 +18,13 @@ pub struct Model {
     pub built_year: Option<i32>,
     /// RC / SRC / 木造 …
     pub structure: Option<String>,
+    /// The station name as written in the rental listing (e.g. "三軒茶屋"),
+    /// not a coordinate-nearest guess. Set once at ingest; never overwritten.
+    pub station_name: Option<String>,
+    /// Real walking time from a Google Maps route, filled in by
+    /// `ingest google-stations`. `None` until that batch reaches this row.
+    pub station_walk_min: Option<i32>,
+    pub station_distance_m: Option<f64>,
     pub updated_at: DateTimeUtc,
 }
 

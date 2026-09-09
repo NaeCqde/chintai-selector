@@ -37,6 +37,8 @@ async fn run() -> anyhow::Result<()> {
         "overpass" => overpass_cmd(&db, &args[1..]).await,
         "rentals" => rentals_cmd(&db, &args[1..]).await,
         "geocode" => geocode_cmd(&db, &http, &args[1..]).await,
+        "google-stations" => google_stations_cmd(&db, &args[1..]).await,
+        "backfill-station-names" => backfill_station_names_cmd(&db, &args[1..]).await,
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -237,6 +239,134 @@ async fn geocode_cmd(
     Ok(())
 }
 
+/// One-time backfill for properties upserted before `station_name` existed:
+/// pull the station name straight out of an already-scraped listing's
+/// `raw_json` (no network — the data is already in the DB). New properties
+/// get `station_name` directly from `rental::ingest_area` and never need this.
+async fn backfill_station_names_cmd(
+    db: &chintai_db::DatabaseConnection,
+    args: &[String],
+) -> anyhow::Result<()> {
+    let limit = args
+        .iter()
+        .position(|a| a == "--limit")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5_000u64);
+
+    let pending = chintai_db::properties_without_station_name(db, limit).await?;
+    log::info!("backfill-station-names: {} properties pending", pending.len());
+    let (mut found, mut empty) = (0u64, 0u64);
+
+    for p in &pending {
+        let mut name = None;
+        'units: for u in chintai_db::units_for_property(db, p.id).await? {
+            for l in chintai_db::listings_for_unit(db, u.id).await? {
+                if let Some(n) = station_name_from_raw_json(&l.raw_json) {
+                    name = Some(n);
+                    break 'units;
+                }
+            }
+        }
+        match &name {
+            Some(n) => {
+                chintai_db::set_property_station_name(db, p.id, n).await?;
+                found += 1;
+            }
+            // Empty-string sentinel: "checked, no station in any listing" —
+            // distinct from NULL ("not checked yet") so this property isn't
+            // re-selected by every future run.
+            None => {
+                chintai_db::set_property_station_name(db, p.id, "").await?;
+                empty += 1;
+            }
+        }
+    }
+    log::info!("backfill-station-names done: found={found} empty={empty}");
+    Ok(())
+}
+
+/// Pull `stations[0].station` out of a `NewListing::raw_json` blob
+/// (`{"building":..,"address":..,"stations":[{"line":..,"station":..,"walk_min":..}],"unit":..}`).
+fn station_name_from_raw_json(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    v.pointer("/stations/0/station")
+        .and_then(|s| s.as_str())
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty())
+}
+
+/// Precomputes the *listing's own* station leg: for every property with a
+/// scraped station name but no walk time yet, resolve that station in our DB
+/// and scrape the real Google Maps walking route to it. This is the only
+/// route the project pre-saves in bulk — routes to a user's own registered
+/// places are always computed live, at search time, by the engine.
+async fn google_stations_cmd(
+    db: &chintai_db::DatabaseConnection,
+    args: &[String],
+) -> anyhow::Result<()> {
+    use chintai_scraper::route::{GoogleMapsScrape, GsiElevation, LatLng, Mode, RouteProvider};
+
+    // One bounded pass, not a re-querying loop: `properties_needing_station_time`
+    // still matches a row after a *transient* Google failure (we don't mark
+    // those), so looping on the same query could spin forever re-fetching an
+    // unchanging head of the queue. A single pass always makes bounded
+    // progress; run the command again (see scripts/crawl_google_stations.sh)
+    // to keep going — already-resolved and already-unresolved rows won't be
+    // re-fetched.
+    let limit = args
+        .iter()
+        .position(|a| a == "--limit")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2_000u64);
+
+    let http = HttpClient::default();
+    let provider = GoogleMapsScrape::new(http.clone(), GsiElevation::new(http));
+
+    let pending = chintai_db::properties_needing_station_time(db, limit).await?;
+    log::info!("google-stations: {} properties pending", pending.len());
+    let run = chintai_db::ingest_run_start(db, "google-stations").await?;
+    let (mut ok, mut miss, mut unresolved) = (0u64, 0u64, 0u64);
+
+    for p in &pending {
+        let Some(name) = &p.station_name else {
+            continue;
+        };
+        let Some(station) = chintai_db::station_by_name(db, name).await? else {
+            chintai_db::mark_property_station_unresolved(db, p.id).await?;
+            unresolved += 1;
+            continue;
+        };
+        let origin = LatLng::new(p.lat.unwrap(), p.lng.unwrap());
+        let dest = LatLng::new(station.lat, station.lng);
+        match provider.route(origin, dest, Mode::Walk).await {
+            Ok(route) => {
+                let mins = (route.duration.as_secs() as f64 / 60.0).ceil() as i32;
+                chintai_db::set_property_station_time(db, p.id, mins, route.distance_m).await?;
+                ok += 1;
+            }
+            Err(e) => {
+                log::warn!("google-stations: {} -> {name}: {e}", p.name);
+                miss += 1;
+            }
+        }
+        if (ok + miss + unresolved) % 50 == 0 {
+            log::info!("google-stations: ok={ok} unresolved={unresolved} miss={miss}");
+        }
+    }
+
+    log::info!("google-stations done: ok={ok} unresolved={unresolved} miss={miss}");
+    chintai_db::ingest_run_finish(
+        db,
+        run,
+        true,
+        Some(&format!("ok={ok} unresolved={unresolved} miss={miss}")),
+    )
+    .await?;
+    Ok(())
+}
+
 #[derive(Default)]
 struct Opts {
     pref: Option<u32>,
@@ -281,6 +411,10 @@ fn print_usage() {
          overpass --all [--grid NxM]                 every prefecture\n\
          rentals --suumo <area> --homes <area> [--pages N]\n\
                                                     e.g. --suumo tokyo/sc_setagaya --homes tokyo/setagaya-city\n\
-         geocode [--limit N]                        fill property coordinates via Nominatim\n"
+         geocode [--limit N]                        fill property coordinates via Nominatim\n\
+         backfill-station-names [--limit N]          one-time: pull station_name from already-\n\
+                                                    scraped listings (default 5000/run, no network)\n\
+         google-stations [--limit N]                Google-Maps-scrape walk time to each\n\
+                                                    property's listed station (default 2000/run)\n"
     );
 }

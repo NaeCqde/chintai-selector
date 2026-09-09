@@ -115,6 +115,5 @@ fn provider_to_db(p: ProviderKind) -> RouteProviderKind {
         ProviderKind::Estimate => RouteProviderKind::Estimate,
         ProviderKind::GoogleScrape => RouteProviderKind::GoogleScrape,
         ProviderKind::GoogleApi => RouteProviderKind::GoogleApi,
-        ProviderKind::YahooScrape => RouteProviderKind::YahooScrape,
     }
 }

@@ -13,7 +13,7 @@ pub use repo::*;
 pub use sea_orm;
 pub use sea_orm::{DatabaseConnection, DbErr};
 
-use sea_orm::ConnectOptions;
+use sea_orm::{ConnectOptions, ConnectionTrait, Statement};
 use sea_orm_migration::MigratorTrait;
 use std::time::Duration;
 
@@ -34,6 +34,19 @@ pub async fn connect(url: &str) -> anyhow::Result<DatabaseConnection> {
         .sqlx_logging(false);
 
     let db = sea_orm::Database::connect(opts).await?;
+
+    // The default rollback-journal mode fsyncs every single statement — brutal
+    // for the ingest binaries, which write one row per HTTP response (a
+    // 150k-property backfill went from "unknown, still running" to done in
+    // seconds after this). WAL lets readers (the server) and the writer
+    // (an ingest pass) run concurrently without blocking each other either.
+    if !is_memory {
+        let backend = db.get_database_backend();
+        for pragma in ["PRAGMA journal_mode=WAL;", "PRAGMA synchronous=NORMAL;"] {
+            db.execute(Statement::from_string(backend, pragma)).await?;
+        }
+    }
+
     migration::Migrator::up(&db, None).await?;
     Ok(db)
 }

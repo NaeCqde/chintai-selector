@@ -121,6 +121,10 @@ pub async fn ingest_area(
                     building_type: b.structure.clone(),
                     built_year: b.built_year,
                     structure: b.structure.clone(),
+                    // The station name exactly as the listing wrote it (not a
+                    // coordinate-nearest guess) — `ingest google-stations`
+                    // walks a real Google Maps route to it for the true time.
+                    station_name: b.stations.first().map(|s| s.station.clone()),
                 },
             )
             .await?;

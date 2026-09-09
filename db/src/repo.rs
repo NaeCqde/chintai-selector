@@ -197,6 +197,8 @@ pub struct NewProperty {
     pub building_type: Option<String>,
     pub built_year: Option<i32>,
     pub structure: Option<String>,
+    /// Station name as written in the listing (e.g. "三軒茶屋"). Set once.
+    pub station_name: Option<String>,
 }
 
 pub async fn upsert_property(
@@ -213,14 +215,20 @@ pub async fn upsert_property(
         building_type: Set(p.building_type),
         built_year: Set(p.built_year),
         structure: Set(p.structure),
+        station_name: Set(p.station_name),
         updated_at: Set(now()),
         ..Default::default()
     })
     .on_conflict(
         OnConflict::columns([property::Column::Name, property::Column::Address])
+            // `lat`/`lng`/`station_name` are filled once (by the coordinate
+            // heuristic / geocoder / this insert) and deliberately excluded
+            // here: a rental re-crawl always passes `lat: None` on this path,
+            // and including them would null out coordinates set afterward by
+            // `set_property_coords`. `station_walk_min`/`station_distance_m`
+            // are never touched by this function at all (see
+            // `set_property_station_time`).
             .update_columns([
-                property::Column::Lat,
-                property::Column::Lng,
                 property::Column::BuildingType,
                 property::Column::BuiltYear,
                 property::Column::Structure,
@@ -369,6 +377,101 @@ pub async fn set_property_coords(
         id: Set(id),
         lat: Set(Some(lat)),
         lng: Set(Some(lng)),
+        updated_at: Set(now()),
+        ..Default::default()
+    })
+    .exec(db)
+    .await?;
+    Ok(())
+}
+
+/// Properties that have a listing station name but no Google-walked time yet —
+/// the queue for `ingest google-stations`. Needs coordinates too, obviously.
+pub async fn properties_needing_station_time(
+    db: &DatabaseConnection,
+    limit: u64,
+) -> Result<Vec<property::Model>, DbErr> {
+    property::Entity::find()
+        .filter(property::Column::StationName.is_not_null())
+        .filter(property::Column::StationName.ne(""))
+        .filter(property::Column::StationWalkMin.is_null())
+        .filter(property::Column::Lat.is_not_null())
+        .order_by_asc(property::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
+pub async fn set_property_station_time(
+    db: &DatabaseConnection,
+    id: i32,
+    walk_min: i32,
+    distance_m: Option<f64>,
+) -> Result<(), DbErr> {
+    property::Entity::update(property::ActiveModel {
+        id: Set(id),
+        station_walk_min: Set(Some(walk_min)),
+        station_distance_m: Set(distance_m),
+        updated_at: Set(now()),
+        ..Default::default()
+    })
+    .exec(db)
+    .await?;
+    Ok(())
+}
+
+/// Properties with no `station_name` yet, oldest first. One-time backfill
+/// target for rows upserted before that column existed — new rows get it
+/// straight from `rental::ingest_area`.
+pub async fn properties_without_station_name(
+    db: &DatabaseConnection,
+    limit: u64,
+) -> Result<Vec<property::Model>, DbErr> {
+    property::Entity::find()
+        .filter(property::Column::StationName.is_null())
+        .order_by_asc(property::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
+pub async fn units_for_property(
+    db: &DatabaseConnection,
+    property_id: i32,
+) -> Result<Vec<unit::Model>, DbErr> {
+    unit::Entity::find()
+        .filter(unit::Column::PropertyId.eq(property_id))
+        .all(db)
+        .await
+}
+
+pub async fn set_property_station_name(
+    db: &DatabaseConnection,
+    id: i32,
+    name: &str,
+) -> Result<(), DbErr> {
+    property::Entity::update(property::ActiveModel {
+        id: Set(id),
+        station_name: Set(Some(name.to_owned())),
+        updated_at: Set(now()),
+        ..Default::default()
+    })
+    .exec(db)
+    .await?;
+    Ok(())
+}
+
+/// Marks a property's station lookup as attempted-but-failed (the station
+/// name didn't resolve against `station`), storing `-1` as a sentinel so it
+/// doesn't get retried on every batch run. `nearest_station_of` in the engine
+/// treats a negative `station_walk_min` as "no station data".
+pub async fn mark_property_station_unresolved(
+    db: &DatabaseConnection,
+    id: i32,
+) -> Result<(), DbErr> {
+    property::Entity::update(property::ActiveModel {
+        id: Set(id),
+        station_walk_min: Set(Some(-1)),
         updated_at: Set(now()),
         ..Default::default()
     })

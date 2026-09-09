@@ -2,49 +2,63 @@
 
 このコミットの内容。次のコミットでまっさらにして書き直す。
 
-## エンジンを実用速度に（推定ルート + 精密化） + 東京/神奈川の POI 完全カバー + 賃貸取得
+前コミット（`ebcf001`）で Google Maps 限定スクレイピング（`/maps/dir` HTML に埋め込まれた
+`/maps/preview/directions?pb=` リンクを踏む2段リクエストで、公共交通の会社・路線・種別・駅・
+時刻・停車数まで取れる）に切り替え済み。今回はその上に、ユーザー指示
+「物件情報に書いてある駅名とそこへの所要時間は Google Map でルートを取得して書き込む／
+事前に保存するのはそれだけ／ユーザー登録地点へのルートはその場でバックエンドが行う」
+を実装。
 
-### 全国 POI → 東京・神奈川を Overpass area クエリで完全投入
+## `property` に駅情報を3カラム追加
 
-- `ingest_prefecture` は `area["ISO3166-2"="JP-NN"]` の 1 クエリで都道府県境ちょうどを
-  カバー（名前一致は 東京都 で失敗するため ISO コード）。ミラー全滅時のみタイル分割へ。
-- 東京 11974 POI（コンビニ 6919 / スーパー 2565 / 郵便局 1587 / 駅 798）、
-  神奈川 5990 POI を投入。合計: brand 1226 / store 14243 / delivery 2653 / station 1210。
+- `station_name`（一覧ページに書かれた駅名そのもの、座標最近傍の推測ではない）、
+  `station_walk_min`（Google Maps 実測、`-1` = 解決を試みたが失敗のセンチネル）、
+  `station_distance_m`。
+- 初期マイグレーション（`create_table_from_entity` ベース）がエンティティから
+  そのまま生成するので、新規 DB はこれで完結。**稼働中の `chintai.sqlite`
+  （150091 件）は既にマイグレーション適用済み**なので、3本の `ALTER TABLE ADD COLUMN`
+  を手動で1回実行して追いつかせた（データは無傷）。
 
-### ルート検索を 2 段構えに
+## `chintai-db`
 
-- `EstimateProvider` 追加 — 直線距離 × 迂回係数 / モード速度 + 待ち時間の **即時見積り**
-  （通信なし・乗換明細なし・`provider: Estimate`）。
-- エンジン: (1) 静的 + POI フィルタ → (2) **直線距離の事前フィルタ**
-  （その時間で物理的に届かない候補を除外）+ 近い順に上限 `ROUTE_CAP=60` →
-  (3) 60 件を `EstimateProvider` で一括評価（数秒）→ ランキング →
-  (4) `SearchRequest.refine=true` のときだけ上位 12 件を実プロバイダ（Google スクレイプ→
-  鍵があれば API）で精密化（所要時間 + 乗換案内）。`route_cache` 併用。
-- `SearchResponse` に `plausible` / `routed` / `capped` を追加。
-- 実測: 3574 候補 → 4.3 秒で順位表示（`refine=false`）。
+- `upsert_property` の `ON CONFLICT UPDATE` から `lat`/`lng` を外した
+  （**バグ修正**: 賃貸スクレイパは毎回 `lat: None` を渡すため、同じ建物を再度
+  upsert すると `set_property_coords` で入れた座標が NULL に巻き戻る経路があった）。
+  `station_name` も同じ理由で対象外（一度設定したら固定）。
+- 追加: `properties_without_station_name` / `set_property_station_name` /
+  `properties_needing_station_time` / `set_property_station_time` /
+  `mark_property_station_unresolved` / `units_for_property`。
 
-### 賃貸物件の座標
+## `chintai-scraper`
 
-- `rental::ingest_area` は新規物件を**最寄り駅座標 + 徒歩分×80m を建物ハッシュ由来の
-  方位へオフセット**した地点に置く（一覧ページに緯度経度がなく、Nominatim は粗い区名を
-  ピンできない）。同じ建物は毎回同じ場所に落ちる。`ingest geocode` が残りを補完。
+- `rental::ingest_area` — 新規物件に `station_name`（`b.stations[0]`）を設定。
+- `ingest backfill-station-names [--limit N]` — **ネットワーク不要**。既存の
+  `listing.raw_json` から `stations[0].station` を読むだけ（座標オフセット計算時に
+  スクレイプ済みのデータを再利用）。見つからなければ空文字センチネルを書き、
+  以後のスキャン対象から外す。
+- `ingest google-stations [--limit N]` — 駅名を `station_by_name` で解決し、
+  `GoogleMapsScrape`（Google Maps のみ、鍵不要）で物件→駅の徒歩ルートを取得して
+  `station_walk_min`/`station_distance_m` に保存。1 回の呼び出しは有限件数で
+  必ず終わる（同じ「未解決」行を無限に再取得するループにしない設計）。
+  `scripts/crawl_google_stations.sh` が空になるまで呼び直す。
 
-### フロント
+## `chintai-server::engine`
 
-- `SearchBar` に「上位の経路を正確に取得（乗換案内・数十秒）」トグル。
-- `RouteDetail` は推定ルートに「推定」バッジ。
-- 結果サマリに「近い順に上限あり」表示。
+- `nearest_station` はもう検索時にライブでスクレイプしない（旧: 上位10件だけ、
+  DB内の最近傍駅にその場でGoogle Mapsを叩いていた）。`property` 行に事前計算済みの
+  値をそのまま読むだけ（`nearest_station_of`）→ 全結果に一律で出る、高速。
+- ユーザー登録地点（`PlaceSpec`）へのルートは従来どおり検索時にバックエンドが
+  その場で計算（推定パス→上位10件を実 Google Maps で精密化）。こちらは変更なし。
 
-### 確認
+## 確認
 
 - `cargo fmt --all --check` / clippy（native `-D warnings` / wasm `-D warnings`）通過。
-- `cargo test --workspace --exclude chintai-web` green（db 6 / scraper 24 / server 6）。
-- `web/build.sh --release` → wasm 611KB。
-- 実データ end-to-end: `POST /api/search`（北千住・公共交通 30 分・家賃 9 万・18㎡ 以上）→
-  HTTP 200 / 4.3 秒、あずま 3.5 万 1K 等が順位付きで返る。
-- ブラウザ目視は全作業完了後にユーザーへ依頼。
-
-### 進行中（バックグラウンド）
-
-- 東京・神奈川の賃貸を SUUMO 全区市 + HOME'S 23 区で **1 秒 1 リクエスト**取得中
-  （`scripts/crawl_rentals.sh`、数時間）。
+- `cargo test --workspace --exclude chintai-web` green（db 6 / scraper 26 / server 6）。
+- **実機**: `GoogleMapsScrape` を今まさに live 実行 — 三軒茶屋→大手町・東京駅の
+  公共交通で 東急田園都市線(準急)→丸ノ内線 の乗換、発着時刻・停車数まで取得、
+  代替4経路（最速33分〜最遅59分）を確認。徒歩ルートも標高付きで確認。
+- **実機**: `backfill-station-names --limit 50` → 50/50 で `station_name` 復元、
+  続けて `google-stations --limit 5` → 5/5 実測（例: 西新井駅 徒歩10分・720m）。
+- 稼働中DB全体（150091件）への `backfill-station-names` をバックグラウンドで実行中
+  （ネットワーク不要、ローカルのみ）。完了後 `google-stations` を低頻度で継続実行し、
+  各物件の駅までの実測時間を埋めていく（Google Maps への配慮からゆっくり）。
