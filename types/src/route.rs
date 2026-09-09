@@ -62,12 +62,12 @@ impl ProviderKind {
 }
 
 /// A local wall-clock time-of-day (24h) to bias a route search by — transit
-/// timetables differ a lot between rush hour and midday. Only the Google
-/// Routes API backend (`GOOGLE_MAPS_API_KEY` set) can currently honour this:
-/// the Google-Maps-scrape path has no reliable way to request a specific
-/// departure time (tried the documented `!6e/!7e/!8j` and `!19m2!2e/!3j`
-/// URL parameters against live Google Maps; neither changed the computed
-/// itinerary), so it always computes "depart now" regardless.
+/// timetables differ a lot between rush hour and midday. Both backends honour
+/// this: the Google Routes API (`GOOGLE_MAPS_API_KEY` set) takes it as an
+/// official `departureTime` field, and the Google-Maps-scrape path patches it
+/// into the generated preview-directions request — see
+/// `chintai_scraper::route::scrape`'s `patch_departure_time` doc for how that
+/// was reverse engineered from a real captured "depart at" URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepartureTime {
     /// 0..=23.

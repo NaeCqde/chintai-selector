@@ -2,7 +2,7 @@
 //!
 //!   cargo test -p chintai-scraper --test route_live -- --ignored --nocapture
 
-use chintai_scraper::route::{GoogleMapsScrape, GsiElevation, LatLng, Mode, RouteProvider};
+use chintai_scraper::route::{DepartureTime, GoogleMapsScrape, GsiElevation, LatLng, Mode, RouteProvider};
 use chintai_scraper::HttpClient;
 
 // 渋谷駅 -> 恵比寿駅 あたり（歩くと坂がある）。
@@ -63,5 +63,45 @@ async fn scrape_transit_returns_totals() {
             r.transit_fastest, r.transit_slowest
         ),
         Err(e) => eprintln!("scrape transit gave nothing (expected-ish): {e}"),
+    }
+}
+
+/// The scrape path can honour a departure time (see `scrape::patch_departure_time`'s
+/// doc) — a real request should come back with itinerary departure clocks
+/// near the requested time, not "now".
+#[tokio::test]
+#[ignore = "hits www.google.com"]
+async fn scrape_transit_honours_departure_time() {
+    let http = HttpClient::default();
+    let p = GoogleMapsScrape::new(http.clone(), GsiElevation::new(http));
+    let requested = DepartureTime::new(8, 0);
+    match p
+        .route(SHIBUYA, EBISU, Mode::Transit, Some(requested))
+        .await
+    {
+        Ok(r) => {
+            // Not necessarily the *first* itinerary: a short trip like this
+            // can have a walk-only "alternative" with no transit leg (and so
+            // no departure clock) sort first by duration. Any itinerary
+            // showing a departure clock is enough to confirm patching works.
+            let depart = r
+                .itineraries
+                .iter()
+                .find_map(|it| it.depart.clone())
+                .expect("at least one transit itinerary with a departure clock time");
+            eprintln!("requested 08:00, got depart={depart}");
+            let hour: u32 = depart
+                .split(':')
+                .next()
+                .and_then(|h| h.parse().ok())
+                .expect("HH:MM");
+            // Loose window (not exactly ==8) since Google may offer the
+            // nearest available departure a few minutes either side.
+            assert!(
+                (7..=9).contains(&hour),
+                "departure {depart} is nowhere near the requested 08:00"
+            );
+        }
+        Err(e) => panic!("scrape transit with departure time failed: {e}"),
     }
 }

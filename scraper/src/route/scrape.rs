@@ -4,11 +4,12 @@
 //! Two requests:
 //!   1. `GET /maps/dir/<from>/<to>/data=!4m2!4m1!3e{mode}` — the HTML embeds a
 //!      `/maps/preview/directions?…&pb=…` link with the exact protobuf request
-//!      for that mode (so we never hand-build `pb`).
-//!   2. `GET` that link — a `)]}'`-prefixed JSON with the full itinerary:
-//!      per-trip duration/distance and, for transit, per-leg operator / line /
-//!      train type / stations / times / stop count, plus the fastest–slowest
-//!      spread across alternatives.
+//!      for that mode (so we never hand-build `pb` from scratch).
+//!   2. `GET` that link (optionally patched for a departure time first — see
+//!      [`patch_departure_time`]) — a `)]}'`-prefixed JSON with the full
+//!      itinerary: per-trip duration/distance and, for transit, per-leg
+//!      operator / line / train type / stations / times / stop count, plus
+//!      the fastest–slowest spread across alternatives.
 //!
 //! The transit leg fields are pulled by scanning each step's subtree for
 //! strings ending in 線 / 駅 and known train-type words, which survives Google's
@@ -16,6 +17,7 @@
 
 use std::time::Duration;
 
+use chrono::{Duration as ChronoDuration, FixedOffset, NaiveTime, Utc};
 use serde_json::Value;
 
 use super::elevation::GsiElevation;
@@ -42,6 +44,7 @@ impl GoogleMapsScrape {
         from: LatLng,
         to: LatLng,
         mode: Mode,
+        departure: Option<DepartureTime>,
     ) -> Result<Value, RouteError> {
         let e = match mode {
             Mode::Car => 0,
@@ -62,12 +65,55 @@ impl GoogleMapsScrape {
 
         let rel = extract_preview_url(&html)
             .ok_or_else(|| RouteError::Parse("no preview/directions link in dir HTML".into()))?;
+        let rel = match departure {
+            Some(d) => patch_departure_time(&rel, e, d)
+                .ok_or_else(|| RouteError::Parse("couldn't patch departure time into pb".into()))?,
+            None => rel,
+        };
         let url = format!("https://www.google.com/{rel}");
 
         let body = self.http.get_text(&url, &[]).await?;
         let json_str = body.strip_prefix(")]}'").unwrap_or(&body).trim_start();
         serde_json::from_str(json_str).map_err(|e| RouteError::Parse(format!("preview json: {e}")))
     }
+}
+
+/// Patches a departure time into the auto-generated preview-directions `pb`
+/// (which defaults to "depart now" and has no time fields at all). Found by
+/// diffing a real "depart at 8:00" URL a user captured from their own
+/// browser against our own default-generated one for the same trip: the
+/// `!20m5!1e{mode}!2e3!5e2!6b1!14b1` block shrinks to `!20m3!5e2!6b1!14b1`
+/// and a new `!19m3!1e0!2e2!3j{ts}` block is inserted right before it.
+///
+/// `{ts}` is *not* a real Unix timestamp for the intended instant: verified
+/// empirically (two otherwise-identical requests, one with the correct UTC
+/// timestamp for "8:00 JST" and one treating "8:00" as if it were already
+/// UTC) that Google reads the JST wall-clock date/time as literal UTC
+/// numerals with no offset applied. So this builds the timestamp the same
+/// way: take the next JST occurrence of `d`'s clock time, then treat those
+/// same calendar numbers as UTC when computing epoch seconds.
+fn patch_departure_time(rel: &str, mode_code: u8, d: DepartureTime) -> Option<String> {
+    let from = format!("%2120m5%211e{mode_code}%212e3%215e2%216b1%2114b1");
+    if !rel.contains(&from) {
+        return None;
+    }
+    let ts = google_naive_departure_timestamp(d);
+    let to = format!("%2119m3%211e0%212e2%213j{ts}%2120m3%215e2%216b1%2114b1");
+    Some(rel.replacen(&from, &to, 1))
+}
+
+/// See [`patch_departure_time`]'s doc for why this deliberately does *not*
+/// convert JST to a true UTC instant.
+fn google_naive_departure_timestamp(d: DepartureTime) -> i64 {
+    let jst = FixedOffset::east_opt(9 * 3600).expect("valid fixed offset");
+    let now_jst = Utc::now().with_timezone(&jst);
+    let target_time = NaiveTime::from_hms_opt(d.hour as u32, d.minute as u32, 0)
+        .unwrap_or_else(|| NaiveTime::from_hms_opt(12, 0, 0).unwrap());
+    let mut date = now_jst.date_naive();
+    if now_jst.time() >= target_time {
+        date += ChronoDuration::days(1);
+    }
+    date.and_time(target_time).and_utc().timestamp()
 }
 
 #[async_trait::async_trait]
@@ -77,13 +123,9 @@ impl RouteProvider for GoogleMapsScrape {
         from: LatLng,
         to: LatLng,
         mode: Mode,
-        // Tried the documented `!6e/!7e/!8j` and the `!19m2!2e/!3j` field
-        // Google's own server transcodes it to — neither changed the
-        // computed itinerary in live testing, so this scrape path has no
-        // known way to honour a departure time. Always "depart now".
-        _departure: Option<DepartureTime>,
+        departure: Option<DepartureTime>,
     ) -> Result<RouteResult, RouteError> {
-        let json = self.directions_json(from, to, mode).await?;
+        let json = self.directions_json(from, to, mode, departure).await?;
         let trips = json
             .pointer("/0/1")
             .and_then(Value::as_array)
@@ -339,6 +381,44 @@ fn straight_line(a: LatLng, b: LatLng, n: usize) -> Vec<LatLng> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trimmed slice of the real preview-directions link Google generates
+    /// for a "depart now" transit request (`e=3`), captured from a live
+    /// request in this project's own testing — same shape the user's
+    /// captured "depart at 8:00" URL had before its `20m`/`19m` block.
+    const BASELINE_TAIL: &str = "%2117m1%213e1%2120m5%211e3%212e3%215e2%216b1%2114b1%2146m1%211b0";
+
+    #[test]
+    fn patch_departure_time_matches_the_real_captured_transformation() {
+        // The exact timestamp a user captured from their own browser for a
+        // real "depart at 8:00 JST" Yano->Hiroshima transit search — fetched
+        // directly and confirmed the response's departure clocks read ~8:00.
+        let d = DepartureTime::new(8, 0);
+        let patched = patch_departure_time(BASELINE_TAIL, 3, d).expect("pattern must match");
+        assert!(patched.contains("%2119m3%211e0%212e2%213j1789027200%2120m3%215e2%216b1%2114b1"));
+        // Everything outside the patched block is untouched.
+        assert!(patched.starts_with("%2117m1%213e1%21"));
+        assert!(patched.ends_with("%2146m1%211b0"));
+    }
+
+    #[test]
+    fn patch_departure_time_is_mode_specific() {
+        // Car (e=0) baseline's 20m block starts with 1e0, not 1e3 — patching
+        // with the wrong mode code must not match.
+        assert!(patch_departure_time(BASELINE_TAIL, 0, DepartureTime::new(8, 0)).is_none());
+    }
+
+    #[test]
+    fn google_naive_departure_timestamp_encodes_hhmm_verbatim() {
+        // Regardless of which date got picked (today vs tomorrow, which
+        // depends on wall-clock "now"), the encoded instant's UTC-numeral
+        // time-of-day must equal the requested JST clock time exactly — that
+        // "no offset applied" behaviour is the whole point (see
+        // `patch_departure_time`'s doc).
+        let d = DepartureTime::new(8, 30);
+        let ts = google_naive_departure_timestamp(d);
+        assert_eq!(ts.rem_euclid(86_400), 8 * 3600 + 30 * 60);
+    }
 
     fn load(name: &str) -> Value {
         let raw = std::fs::read_to_string(format!("tests/fixtures/{name}")).unwrap();
