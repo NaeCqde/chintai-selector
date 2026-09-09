@@ -29,7 +29,15 @@ yokohamashikonan yokohamashimidori yokohamashiminami yokohamashinaka \
 yokohamashinishi yokohamashisakae yokohamashiseya yokohamashitotsuka \
 yokohamashitsurumi yokohamashitsuzuki yokosuka zama zushi"
 
-# --- HOME'S: the 23 special wards (they map cleanly to <romaji>-city) ------
+# --- HOME'S / AtHome: <romaji>-city (both use this convention) ------------
+# HOME'S only reliably serves the 23 special wards this way (Tama/Kanagawa
+# under this pattern 403/202'd during testing); AtHome's URL routing accepted
+# every city we tried (Tokyo wards, Tama, Yokohama, Kawasaki), so it gets the
+# full list. AtHome also has bot-defense that a burst of rapid manual testing
+# tripped during development (a puzzle-challenge page instead of listings) —
+# the actual crawl here paces to 1 req/s via HttpClient's limiter, which is
+# the polite pattern the defense is meant to allow, but if it starts
+# returning 0 buildings across the board, that's this kicking in again.
 HOMES_TOKYO_WARDS="chiyoda chuo minato shinjuku bunkyo taito sumida koto \
 shinagawa meguro ota setagaya shibuya nakano suginami toshima kita arakawa \
 itabashi nerima adachi katsushika edogawa"
@@ -37,6 +45,8 @@ itabashi nerima adachi katsushika edogawa"
 for w in $SUUMO_TOKYO;    do "$BIN" rentals --pages "$PAGES" --interval-ms 1000 --suumo "tokyo/sc_$w";    done
 for w in $SUUMO_KANAGAWA; do "$BIN" rentals --pages "$PAGES" --interval-ms 1000 --suumo "kanagawa/sc_$w"; done
 for w in $HOMES_TOKYO_WARDS; do "$BIN" rentals --pages "$PAGES" --interval-ms 1000 --homes "tokyo/$w-city"; done
+for w in $SUUMO_TOKYO;    do "$BIN" rentals --pages "$PAGES" --interval-ms 1000 --athome "tokyo/$w-city";    done
+for w in $SUUMO_KANAGAWA; do "$BIN" rentals --pages "$PAGES" --interval-ms 1000 --athome "kanagawa/$w-city"; done
 
 # Geocode whatever the station-name heuristic didn't resolve.
 "$BIN" geocode --limit 20000

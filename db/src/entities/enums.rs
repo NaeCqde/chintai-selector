@@ -52,4 +52,5 @@ pub enum RouteProviderKind {
 pub enum ListingSite {
     Suumo,
     Homes,
+    Athome,
 }

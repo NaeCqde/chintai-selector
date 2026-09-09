@@ -2,63 +2,58 @@
 
 このコミットの内容。次のコミットでまっさらにして書き直す。
 
-前コミット（`ebcf001`）で Google Maps 限定スクレイピング（`/maps/dir` HTML に埋め込まれた
-`/maps/preview/directions?pb=` リンクを踏む2段リクエストで、公共交通の会社・路線・種別・駅・
-時刻・停車数まで取れる）に切り替え済み。今回はその上に、ユーザー指示
-「物件情報に書いてある駅名とそこへの所要時間は Google Map でルートを取得して書き込む／
-事前に保存するのはそれだけ／ユーザー登録地点へのルートはその場でバックエンドが行う」
-を実装。
+## 所要時間データの異常値監査
 
-## `property` に駅情報を3カラム追加
+現時点でGoogle Mapsから取得済みの駅までの所要時間（1,977件時点）を全件クエリで確認。
+**「徒歩2時間」のような異常値は皆無**：
 
-- `station_name`（一覧ページに書かれた駅名そのもの、座標最近傍の推測ではない）、
-  `station_walk_min`（Google Maps 実測、`-1` = 解決を試みたが失敗のセンチネル）、
-  `station_distance_m`。
-- 初期マイグレーション（`create_table_from_entity` ベース）がエンティティから
-  そのまま生成するので、新規 DB はこれで完結。**稼働中の `chintai.sqlite`
-  （150091 件）は既にマイグレーション適用済み**なので、3本の `ALTER TABLE ADD COLUMN`
-  を手動で1回実行して追いつかせた（データは無傷）。
+| 所要時間 | 件数 |
+|---|---|
+| 0-15分 | 1041 |
+| 15-30分 | 740 |
+| 30-45分 | 72 |
+| 45-60分 | 7 |
+| 60分以上 | **0件** |
 
-## `chintai-db`
+最大は48分（jtテラスハウス扇大橋弐番館→扇大橋駅、3447m）。距離と時間から逆算した
+歩行速度は上位20件で一貫して69〜72m/分（Google基準の80m/分よりやや保守的だが、
+実際の道なり距離を反映しており異常ではない）。処理は現在足立区周辺のため、今後
+広い範囲が入るとさらに分布は変わる見込み。バックグラウンドの `google-stations` は継続稼働中。
 
-- `upsert_property` の `ON CONFLICT UPDATE` から `lat`/`lng` を外した
-  （**バグ修正**: 賃貸スクレイパは毎回 `lat: None` を渡すため、同じ建物を再度
-  upsert すると `set_property_coords` で入れた座標が NULL に巻き戻る経路があった）。
-  `station_name` も同じ理由で対象外（一度設定したら固定）。
-- 追加: `properties_without_station_name` / `set_property_station_name` /
-  `properties_needing_station_time` / `set_property_station_time` /
-  `mark_property_station_unresolved` / `units_for_property`。
+## アットホーム（athome.co.jp）を賃貸データ源に追加
 
-## `chintai-scraper`
+`scraper::rental::Athome`。`.property-card` per 建物、`.room-info-section` per 部屋。
+`tokyo/setagaya-city` 形式（HOME'S と同じ規約）。非ブラウザUAで動作確認。
 
-- `rental::ingest_area` — 新規物件に `station_name`（`b.stations[0]`）を設定。
-- `ingest backfill-station-names [--limit N]` — **ネットワーク不要**。既存の
-  `listing.raw_json` から `stations[0].station` を読むだけ（座標オフセット計算時に
-  スクレイプ済みのデータを再利用）。見つからなければ空文字センチネルを書き、
-  以後のスキャン対象から外す。
-- `ingest google-stations [--limit N]` — 駅名を `station_by_name` で解決し、
-  `GoogleMapsScrape`（Google Maps のみ、鍵不要）で物件→駅の徒歩ルートを取得して
-  `station_walk_min`/`station_distance_m` に保存。1 回の呼び出しは有限件数で
-  必ず終わる（同じ「未解決」行を無限に再取得するループにしない設計）。
-  `scripts/crawl_google_stations.sh` が空になるまで呼び直す。
+実装中に**実データで2件のバグを発見・修正**（トリミングした実HTMLフィクスチャで
+`cargo test` に固定化済み）:
+- `.info-item--type` は `<br>` で区切られた**2つの別テキストノード**
+  （"賃貸マンション 3階建" と "2022年3月(築4年7ヶ月)"）。素朴に結合→
+  空白分割すると2つがくっつき、`built_year` が `32026`（"3階建"の"3"+"2026"）
+  のような値になっていた → ノード単位で取得するよう修正。
+- 駅名が `「千歳烏山」駅` のようにアットホーム独自の鉤括弧付き表記
+  （SUUMO/HOME'S の `line/station 歩N分` とは別形式）→ 括弧を剥がして
+  `station_by_name` が引ける形（例: `千歳烏山駅`）にする専用パーサを追加。
+  これを直さないと `ingest google-stations` が一件も解決できなかった。
+- 部屋番号（"２０４"等）から階を復元（AtHomeは階を別フィールドで出さない）。
 
-## `chintai-server::engine`
+`ingest rentals --athome <area>` / `scripts/crawl_rentals.sh` にも組み込み。
 
-- `nearest_station` はもう検索時にライブでスクレイプしない（旧: 上位10件だけ、
-  DB内の最近傍駅にその場でGoogle Mapsを叩いていた）。`property` 行に事前計算済みの
-  値をそのまま読むだけ（`nearest_station_of`）→ 全結果に一律で出る、高速。
-- ユーザー登録地点（`PlaceSpec`）へのルートは従来どおり検索時にバックエンドが
-  その場で計算（推定パス→上位10件を実 Google Maps で精密化）。こちらは変更なし。
+### ⚠️ 実機確認の状況（正直な報告）
+
+- 初回の実リクエストは成功し、実データ8棟をフィクスチャに保存・パース確認済み。
+- その後の**手動での連続テスト（短時間に約10リクエスト）でアットホームのBot対策
+  （パズル認証ページ）を踏んでしまい、テスト元IPが一時ブロックされた**
+  （UAを変えても同じ、IP起因）。2分以上空けても解除されず、現状はまだブロック中。
+- 実装した `ingest rentals --athome` 自体は1リクエスト/秒程度のペースで動くため、
+  通常はこの手動連投とは異なる挙動になるはずだが、**継続稼働で同じ防御が再度
+  作動する可能性は否定できない**。全件0棟が続くようなら、この防御によるものと判断してほしい。
 
 ## 確認
 
-- `cargo fmt --all --check` / clippy（native `-D warnings` / wasm `-D warnings`）通過。
-- `cargo test --workspace --exclude chintai-web` green（db 6 / scraper 26 / server 6）。
-- **実機**: `GoogleMapsScrape` を今まさに live 実行 — 三軒茶屋→大手町・東京駅の
-  公共交通で 東急田園都市線(準急)→丸ノ内線 の乗換、発着時刻・停車数まで取得、
-  代替4経路（最速33分〜最遅59分）を確認。徒歩ルートも標高付きで確認。
-- **実機**: `backfill-station-names --limit 50` → 50/50 で `station_name` 復元、
-  続けて `google-stations --limit 5` → 5/5 実測（例: 西新井駅 徒歩10分・720m）。
-- 稼働中DB全体（150091件）への `backfill-station-names` をバックグラウンドで実行中
-  （ネットワーク不要、ローカルのみ）。完了後 `google-stations` を低頻度で継続実行し、
-  各物件の駅までの実測時間を埋めていく（Google Maps への配慮からゆっくり）。
+- `cargo fmt --all --check` / `cargo clippy --workspace --exclude chintai-web --all-targets -- -D warnings` 通過。
+- `cargo test -p chintai-scraper --lib`: **29/29** green（athome 3件含む、新規）。
+- `cargo test -p chintai-db -p chintai-server`: 6+6 green。
+- `cargo test --workspace`（bin込みフル）は実行中の `google-stations` バックグラウンド
+  プロセスが `ingest.exe` をロックしているため今回未実施（ロジックはlibテスト・
+  clippy・手動DB検証で担保）。

@@ -1,8 +1,9 @@
-//! Rental-listing collection: SUUMO and LIFULL HOME'S list-page adapters, plus
-//! the persistence that resolves scraped rows onto canonical `property` /
-//! `unit` records (de-duplicating the same room seen on both sites) and keeps
-//! the raw per-site row in `listing`.
+//! Rental-listing collection: SUUMO, LIFULL HOME'S and AtHome list-page
+//! adapters, plus the persistence that resolves scraped rows onto canonical
+//! `property` / `unit` records (de-duplicating the same room seen on
+//! multiple sites) and keeps the raw per-site row in `listing`.
 
+pub mod athome;
 pub mod homes;
 pub mod normalize;
 pub mod suumo;
@@ -16,6 +17,7 @@ use chintai_db::{
 use crate::http::HttpError;
 use crate::HttpClient;
 
+pub use athome::Athome;
 pub use homes::Homes;
 pub use suumo::Suumo;
 

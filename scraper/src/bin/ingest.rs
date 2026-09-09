@@ -127,10 +127,11 @@ fn finish(db: &chintai_db::DatabaseConnection, run_id: i32, res: &Result<u64, St
 }
 
 async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> anyhow::Result<()> {
-    use chintai_scraper::rental::{ingest_area, Homes, Suumo};
+    use chintai_scraper::rental::{ingest_area, Athome, Homes, Suumo};
 
     let mut suumo_areas: Vec<String> = Vec::new();
     let mut homes_areas: Vec<String> = Vec::new();
+    let mut athome_areas: Vec<String> = Vec::new();
     let mut pages = 3u32;
     let mut interval_ms = 1000u64; // user asked for a gentle 1 req/s
     let mut it = args.iter();
@@ -138,6 +139,10 @@ async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> an
         match a.as_str() {
             "--suumo" => it.next().map(|s| suumo_areas.push(s.clone())).unwrap_or(()),
             "--homes" => it.next().map(|s| homes_areas.push(s.clone())).unwrap_or(()),
+            "--athome" => it
+                .next()
+                .map(|s| athome_areas.push(s.clone()))
+                .unwrap_or(()),
             "--pages" => pages = it.next().and_then(|s| s.parse().ok()).unwrap_or(pages),
             "--interval-ms" => {
                 interval_ms = it
@@ -148,14 +153,15 @@ async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> an
             _ => {}
         }
     }
-    if suumo_areas.is_empty() && homes_areas.is_empty() {
-        anyhow::bail!("rentals needs --suumo <area> and/or --homes <area> (repeatable). e.g. --suumo tokyo/sc_setagaya --homes tokyo/setagaya-city");
+    if suumo_areas.is_empty() && homes_areas.is_empty() && athome_areas.is_empty() {
+        anyhow::bail!("rentals needs --suumo/--homes/--athome <area> (repeatable). e.g. --suumo tokyo/sc_setagaya --homes tokyo/setagaya-city --athome tokyo/setagaya-city");
     }
     let iv = std::time::Duration::from_millis(interval_ms);
     log::info!(
-        "rentals: {} suumo + {} homes areas, {} pages max, {}ms/req",
+        "rentals: {} suumo + {} homes + {} athome areas, {} pages max, {}ms/req",
         suumo_areas.len(),
         homes_areas.len(),
+        athome_areas.len(),
         pages,
         interval_ms
     );
@@ -178,6 +184,16 @@ async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> an
         chintai_db::ingest_run_finish(db, run, res.is_ok(), Some(&format!("{res:?}"))).await?;
         if let Err(e) = res {
             log::error!("homes {area}: {e}");
+        }
+    }
+    for area in athome_areas {
+        let run = chintai_db::ingest_run_start(db, &format!("rentals:athome:{area}")).await?;
+        let src = Athome::new(HttpClient::new(iv));
+        let res = ingest_area(db, &src, &area, pages).await;
+        log_rentals("athome", &area, &res);
+        chintai_db::ingest_run_finish(db, run, res.is_ok(), Some(&format!("{res:?}"))).await?;
+        if let Err(e) = res {
+            log::error!("athome {area}: {e}");
         }
     }
     Ok(())
@@ -412,8 +428,9 @@ fn print_usage() {
          overpass --pref <1..47> [--grid NxM]        one prefecture (default grid 3x3)\n\
          overpass --bbox <s,w,n,e>                   one bounding box\n\
          overpass --all [--grid NxM]                 every prefecture\n\
-         rentals --suumo <area> --homes <area> [--pages N]\n\
+         rentals --suumo/--homes/--athome <area> [--pages N] (each repeatable)\n\
                                                     e.g. --suumo tokyo/sc_setagaya --homes tokyo/setagaya-city\n\
+                                                         --athome tokyo/setagaya-city\n\
          geocode [--limit N]                        fill property coordinates via Nominatim\n\
          backfill-station-names [--limit N]          one-time: pull station_name from already-\n\
                                                     scraped listings (default 5000/run, no network)\n\
