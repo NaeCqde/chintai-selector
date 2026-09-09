@@ -18,6 +18,8 @@ pub struct Suumo {
 
 impl Suumo {
     pub fn new(http: HttpClient) -> Self {
+        // Pace is tuned in `crate::pacing::SUUMO`.
+        http.set_host_interval("suumo.jp", crate::pacing::SUUMO);
         Self {
             http,
             this_year: super::current_year(),

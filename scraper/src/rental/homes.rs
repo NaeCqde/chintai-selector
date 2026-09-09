@@ -22,6 +22,8 @@ pub struct Homes {
 impl Homes {
     /// `http` must be a browser client (`HttpClient::browser`).
     pub fn new(http: HttpClient) -> Self {
+        // Pace is tuned in `crate::pacing::HOMES`.
+        http.set_host_interval("www.homes.co.jp", crate::pacing::HOMES);
         Self {
             http,
             this_year: super::current_year(),

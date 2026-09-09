@@ -40,11 +40,8 @@ pub struct NominatimGeocoder {
 
 impl NominatimGeocoder {
     pub fn new(http: HttpClient) -> Self {
-        // Nominatim's usage policy asks for ≤ 1 req/s from one source.
-        http.set_host_interval(
-            "nominatim.openstreetmap.org",
-            std::time::Duration::from_millis(1100),
-        );
+        // Pace is tuned in `crate::pacing::NOMINATIM`.
+        http.set_host_interval("nominatim.openstreetmap.org", crate::pacing::NOMINATIM);
         Self {
             http,
             base_url: "https://nominatim.openstreetmap.org/search".to_owned(),

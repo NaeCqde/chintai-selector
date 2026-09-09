@@ -74,13 +74,14 @@ impl Overpass {
             std::time::Duration::from_secs(12),
             std::time::Duration::from_secs(660),
         );
+        // Pace is tuned in `crate::pacing::OVERPASS`.
         for host in [
             "overpass-api.de",
             "overpass.kumi.systems",
             "overpass.openstreetmap.fr",
             "overpass.private.coffee",
         ] {
-            http.set_host_interval(host, std::time::Duration::from_secs(12));
+            http.set_host_interval(host, crate::pacing::OVERPASS);
         }
         Self { http }
     }

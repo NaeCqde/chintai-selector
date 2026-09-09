@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Slow, complete rental crawl for Tokyo + Kanagawa at ~1 request/second.
+# Complete rental crawl for Tokyo + Kanagawa. Per-site pace is tuned in
+# `chintai_scraper::pacing` (scraper/src/pacing.rs), not on this command line.
 # Personal use. Run from the repo root after `cargo build -p chintai-scraper`.
 #
 #   CHINTAI_DB="sqlite://chintai.sqlite?mode=rwc" scripts/crawl_rentals.sh
@@ -35,18 +36,18 @@ yokohamashitsurumi yokohamashitsuzuki yokosuka zama zushi"
 # every city we tried (Tokyo wards, Tama, Yokohama, Kawasaki), so it gets the
 # full list. AtHome also has bot-defense that a burst of rapid manual testing
 # tripped during development (a puzzle-challenge page instead of listings) —
-# the actual crawl here paces to 1 req/s via HttpClient's limiter, which is
-# the polite pattern the defense is meant to allow, but if it starts
-# returning 0 buildings across the board, that's this kicking in again.
+# its pace lives at `pacing::ATHOME`, separate from every other site, so it
+# can be slowed down on its own without touching SUUMO/HOME'S/Google Maps/etc.
+# if a sustained crawl starts coming back with 0 buildings across the board.
 HOMES_TOKYO_WARDS="chiyoda chuo minato shinjuku bunkyo taito sumida koto \
 shinagawa meguro ota setagaya shibuya nakano suginami toshima kita arakawa \
 itabashi nerima adachi katsushika edogawa"
 
-for w in $SUUMO_TOKYO;    do "$BIN" rentals --pages "$PAGES" --interval-ms 1000 --suumo "tokyo/sc_$w";    done
-for w in $SUUMO_KANAGAWA; do "$BIN" rentals --pages "$PAGES" --interval-ms 1000 --suumo "kanagawa/sc_$w"; done
-for w in $HOMES_TOKYO_WARDS; do "$BIN" rentals --pages "$PAGES" --interval-ms 1000 --homes "tokyo/$w-city"; done
-for w in $SUUMO_TOKYO;    do "$BIN" rentals --pages "$PAGES" --interval-ms 1000 --athome "tokyo/$w-city";    done
-for w in $SUUMO_KANAGAWA; do "$BIN" rentals --pages "$PAGES" --interval-ms 1000 --athome "kanagawa/$w-city"; done
+for w in $SUUMO_TOKYO;    do "$BIN" rentals --pages "$PAGES" --suumo "tokyo/sc_$w";    done
+for w in $SUUMO_KANAGAWA; do "$BIN" rentals --pages "$PAGES" --suumo "kanagawa/sc_$w"; done
+for w in $HOMES_TOKYO_WARDS; do "$BIN" rentals --pages "$PAGES" --homes "tokyo/$w-city"; done
+for w in $SUUMO_TOKYO;    do "$BIN" rentals --pages "$PAGES" --athome "tokyo/$w-city";    done
+for w in $SUUMO_KANAGAWA; do "$BIN" rentals --pages "$PAGES" --athome "kanagawa/$w-city"; done
 
 # Geocode whatever the station-name heuristic didn't resolve.
 "$BIN" geocode --limit 20000

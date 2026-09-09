@@ -28,10 +28,8 @@ pub struct ElevationDelta {
 
 impl GsiElevation {
     pub fn new(http: HttpClient) -> Self {
-        http.set_host_interval(
-            "cyberjapandata2.gsi.go.jp",
-            std::time::Duration::from_millis(250),
-        );
+        // Pace is tuned in `crate::pacing::GSI_ELEVATION`.
+        http.set_host_interval("cyberjapandata2.gsi.go.jp", crate::pacing::GSI_ELEVATION);
         Self { http }
     }
 

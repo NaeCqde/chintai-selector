@@ -30,9 +30,10 @@ pub struct GoogleMapsScrape {
 
 impl GoogleMapsScrape {
     pub fn new(http: HttpClient, elevation: GsiElevation) -> Self {
-        // Personal use: a brisk-but-not-hammering pace for the two requests
-        // each route needs.
-        http.set_host_interval("www.google.com", std::time::Duration::from_millis(800));
+        // Pace is tuned in `crate::pacing` — same knob for the bulk
+        // property->station precompute and the live per-search
+        // property->place routes the engine fetches on the spot.
+        http.set_host_interval("www.google.com", crate::pacing::GOOGLE_MAPS);
         Self { http, elevation }
     }
 

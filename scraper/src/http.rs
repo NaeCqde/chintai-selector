@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 /// Default minimum gap between two requests to the same host.
-const DEFAULT_MIN_INTERVAL: Duration = Duration::from_millis(1200);
+const DEFAULT_MIN_INTERVAL: Duration = Duration::from_millis(300);
 
 #[derive(Clone)]
 pub struct HttpClient {

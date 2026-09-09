@@ -2,37 +2,34 @@
 
 このコミットの内容。次のコミットでまっさらにして書き直す。
 
-## 地図にハザードマップ重ね合わせ機能を追加
+## スクレイピング速度をサイトごとに設定できる仕組みに変更
 
-国土地理院「重ねるハザードマップ」の公開XYZタイル（`disaportaldata.gsi.go.jp`、鍵不要）を
-MapLibre のラスターレイヤーとして追加。地図左上に4種類のチェックボックスを表示:
+`scraper/src/pacing.rs` を新設し、サイト（ホスト）ごとのリクエスト間隔を1箇所に集約。
+各アダプタのコンストラクタが自分のホスト分だけを `HttpClient::set_host_interval` で
+適用する（既存の Nominatim/Google Maps/GSI標高/Overpass のパターンを、SUUMO/HOME'S/
+AtHome にも展開した形）。自動でリトライ間隔を調整するような仕組みは意図的に作らず、
+ブロックされたら該当サイトの定数を人間が下げて再ビルドする、という運用にしている。
 
-- 洪水浸水想定（`01_flood_l2_shinsuishin_data`、想定最大規模）
-- 土砂災害警戒区域（`05_dosekiryukeikaikuiki`急傾斜地／`05_kyukeishakeikaikuiki`土石流／
-  `05_jisuberikeikaikuiki`地すべりの3レイヤーを1トグルでまとめて表示・非表示）
-- 津波浸水想定（`04_tsunami_newlegend_data`）
-- 高潮浸水想定（`03_hightide_l2_shinsuishin_data`）
-
-各パスは実際にタイルを取得して確認済み（箱根＝土砂災害、鎌倉沿岸＝津波/高潮、
-江戸川区＝洪水、いずれも該当ハザードのあるタイルで200を確認）。
-
-- `index.html` の MapLibre シムに `setHazard(kind, visible)` を追加。
-  レイヤーは初回トグル時に遅延生成、不透明度0.6、POIドット・経路線より下・
-  ベース地図より上に挿入（`beforeId: "pois"`）。
-- `web/src/maplibre.rs` に `set_hazard` バインディングを追加。
-- `web/src/app.rs` に `HazardPanel` コンポーネント（4チェックボックス＋出典表示
-  「ハザードマップポータルサイト（国土地理院）」リンク）を追加し、地図左上に配置。
-  トグル状態はセッション内のみ（他の検索条件と違い localStorage には保存しない）。
+- 全サイトのデフォルトを1.2秒→**0.3秒**に変更（ユーザー指示）。
+  - SUUMO (`suumo.jp`) / HOME'S (`www.homes.co.jp`) / AtHome (`www.athome.co.jp`)
+  - Google Maps (`www.google.com`) — 物件→駅の一括事前計算と、検索時にエンジンが
+    その場で叩く物件→ユーザー登録地点のライブルート取得の両方に効く
+  - Nominatim (`nominatim.openstreetmap.org`) / GSI標高 (`cyberjapandata2.gsi.go.jp`)
+    / Overpass（各ミラー）
+  - AtHome は既知のbot対策（パズル認証）があるため他サイトと別定数
+    （`pacing::ATHOME`）に分けてあり、詰まったらそこだけ下げられる。
+- `ingest rentals` の `--interval-ms` フラグは廃止（後方互換のため引数は読み捨てるが
+  もう何もしない）。サイトの速度は呼び出し時の引数ではなく `pacing.rs` の定数で決まる。
+- `scripts/crawl_rentals.sh` から `--interval-ms` 指定を削除、コメントを更新。
 
 ## 確認
 
-- `cargo build -p chintai-web --target wasm32-unknown-unknown` / `clippy -D warnings` 通過。
-- 埋め込みJSを `node --check` で構文検証。
-- `web/build.sh --release` → `web/dist` に反映確認（index.html/style.css/chintai.js すべてに
-  ハザード関連の内容が含まれることを確認）。
-- `chintai-server` を起動し `/` `/style.css` の配信を確認（ブラウザでの見た目は未確認）。
-- `cargo test -p chintai-db -p chintai-server` 引き続き green（回帰なし）。
+- `cargo build --workspace` / `cargo clippy --workspace --exclude chintai-web -D warnings` 通過。
+- `cargo test -p chintai-scraper -p chintai-db -p chintai-server` 35件すべてgreen。
+- `ingest google-stations --limit 20` を実測: 1件あたり約4.5秒（ボトルネックは
+  Google Mapsそのものではなく、経路1本につき最大16回呼ぶGSI標高サンプリング）。
+  詰まったりブロックされたりする様子はなし。
 
 ## バックグラウンド継続中
 
-- `google-stations`（駅までの実所要時間取得）: 継続稼働中。
+- `google-stations`（駅までの実所要時間取得）: 新しいペース設定で再起動して継続稼働中。

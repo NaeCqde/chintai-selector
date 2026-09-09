@@ -21,6 +21,10 @@ pub struct Athome {
 
 impl Athome {
     pub fn new(http: HttpClient) -> Self {
+        // Pace is tuned in `crate::pacing::ATHOME` — kept separate from the
+        // other sites since this one has bot-defense that has tripped before
+        // (see the module doc comment on `pacing::ATHOME`).
+        http.set_host_interval("www.athome.co.jp", crate::pacing::ATHOME);
         Self {
             http,
             this_year: super::current_year(),

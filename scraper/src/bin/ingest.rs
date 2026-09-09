@@ -133,7 +133,6 @@ async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> an
     let mut homes_areas: Vec<String> = Vec::new();
     let mut athome_areas: Vec<String> = Vec::new();
     let mut pages = 3u32;
-    let mut interval_ms = 1000u64; // user asked for a gentle 1 req/s
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -144,11 +143,11 @@ async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> an
                 .map(|s| athome_areas.push(s.clone()))
                 .unwrap_or(()),
             "--pages" => pages = it.next().and_then(|s| s.parse().ok()).unwrap_or(pages),
+            // Accepted for backward compatibility with older invocations;
+            // per-site pace now lives in `chintai_scraper::pacing` and each
+            // adapter applies its own entry, so this no longer does anything.
             "--interval-ms" => {
-                interval_ms = it
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(interval_ms)
+                it.next();
             }
             _ => {}
         }
@@ -156,19 +155,17 @@ async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> an
     if suumo_areas.is_empty() && homes_areas.is_empty() && athome_areas.is_empty() {
         anyhow::bail!("rentals needs --suumo/--homes/--athome <area> (repeatable). e.g. --suumo tokyo/sc_setagaya --homes tokyo/setagaya-city --athome tokyo/setagaya-city");
     }
-    let iv = std::time::Duration::from_millis(interval_ms);
     log::info!(
-        "rentals: {} suumo + {} homes + {} athome areas, {} pages max, {}ms/req",
+        "rentals: {} suumo + {} homes + {} athome areas, {} pages max (pace: see chintai_scraper::pacing)",
         suumo_areas.len(),
         homes_areas.len(),
         athome_areas.len(),
         pages,
-        interval_ms
     );
 
     for area in suumo_areas {
         let run = chintai_db::ingest_run_start(db, &format!("rentals:suumo:{area}")).await?;
-        let src = Suumo::new(HttpClient::new(iv));
+        let src = Suumo::new(HttpClient::default());
         let res = ingest_area(db, &src, &area, pages).await;
         log_rentals("suumo", &area, &res);
         chintai_db::ingest_run_finish(db, run, res.is_ok(), Some(&format!("{res:?}"))).await?;
@@ -178,7 +175,7 @@ async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> an
     }
     for area in homes_areas {
         let run = chintai_db::ingest_run_start(db, &format!("rentals:homes:{area}")).await?;
-        let src = Homes::new(HttpClient::browser(iv));
+        let src = Homes::new(HttpClient::browser(chintai_scraper::pacing::HOMES));
         let res = ingest_area(db, &src, &area, pages).await;
         log_rentals("homes", &area, &res);
         chintai_db::ingest_run_finish(db, run, res.is_ok(), Some(&format!("{res:?}"))).await?;
@@ -188,7 +185,7 @@ async fn rentals_cmd(db: &chintai_db::DatabaseConnection, args: &[String]) -> an
     }
     for area in athome_areas {
         let run = chintai_db::ingest_run_start(db, &format!("rentals:athome:{area}")).await?;
-        let src = Athome::new(HttpClient::new(iv));
+        let src = Athome::new(HttpClient::default());
         let res = ingest_area(db, &src, &area, pages).await;
         log_rentals("athome", &area, &res);
         chintai_db::ingest_run_finish(db, run, res.is_ok(), Some(&format!("{res:?}"))).await?;

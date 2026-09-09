@@ -13,6 +13,7 @@
 
 pub mod geocode;
 pub mod http;
+pub mod pacing;
 pub mod poi;
 pub mod rental;
 pub mod route;
