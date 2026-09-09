@@ -126,10 +126,21 @@ pub struct RankedProperty {
     pub best_unit: UnitView,
     pub other_units: Vec<UnitView>,
     pub places: Vec<PlaceAccess>,
+    /// The listing's nearest station, with the walk time from Google Maps.
+    #[serde(default)]
+    pub nearest_station: Option<NearestStation>,
     pub nearest_conveni_m: Option<f64>,
     pub nearest_super_m: Option<f64>,
     pub nearest_cheap_super_m: Option<f64>,
     pub nearest_delivery_m: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NearestStation {
+    pub name: String,
+    /// Walk time from the property, from a Google Maps route.
+    pub walk_minutes: u32,
+    pub distance_m: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

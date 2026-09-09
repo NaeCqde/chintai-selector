@@ -1,16 +1,22 @@
-//! Google Maps directions scrape — `reqwest` only, no browser.
+//! Google Maps directions scrape — `reqwest` only, no browser, **Google Maps
+//! only** (per project direction).
 //!
-//! What actually works without a headless browser: hitting `/maps/dir/…` and
-//! reading the **durations** back out of the server-rendered HTML
-//! (`APP_INITIALIZATION_STATE` plus visible "X分" / "X時間Y分" text). What
-//! mostly does *not* survive without executing Maps' JS: the structured
-//! per-leg transit detail (line, operator, stations, times). So for `Transit`
-//! this backend returns the fastest/slowest totals and little else, and
-//! [`super::FallbackProvider`] escalates to the API for the detail. For
-//! `Walk`/`Car` a duration is the whole answer, and we add elevation from GSI
-//! by sampling the straight line.
+//! Two requests:
+//!   1. `GET /maps/dir/<from>/<to>/data=!4m2!4m1!3e{mode}` — the HTML embeds a
+//!      `/maps/preview/directions?…&pb=…` link with the exact protobuf request
+//!      for that mode (so we never hand-build `pb`).
+//!   2. `GET` that link — a `)]}'`-prefixed JSON with the full itinerary:
+//!      per-trip duration/distance and, for transit, per-leg operator / line /
+//!      train type / stations / times / stop count, plus the fastest–slowest
+//!      spread across alternatives.
+//!
+//! The transit leg fields are pulled by scanning each step's subtree for
+//! strings ending in 線 / 駅 and known train-type words, which survives Google's
+//! frequent index reshuffles better than fixed paths.
 
 use std::time::Duration;
+
+use serde_json::Value;
 
 use super::elevation::GsiElevation;
 use super::types::*;
@@ -24,140 +30,286 @@ pub struct GoogleMapsScrape {
 
 impl GoogleMapsScrape {
     pub fn new(http: HttpClient, elevation: GsiElevation) -> Self {
+        // Personal use: a brisk-but-not-hammering pace for the two requests
+        // each route needs.
+        http.set_host_interval("www.google.com", std::time::Duration::from_millis(800));
         Self { http, elevation }
+    }
+
+    async fn directions_json(
+        &self,
+        from: LatLng,
+        to: LatLng,
+        mode: Mode,
+    ) -> Result<Value, RouteError> {
+        let e = match mode {
+            Mode::Car => 0,
+            Mode::Walk => 2,
+            Mode::Transit => 3,
+        };
+        let dir_url = format!(
+            "https://www.google.com/maps/dir/{},{}/{},{}/data=!4m2!4m1!3e{e}",
+            from.lat, from.lng, to.lat, to.lng
+        );
+        let html = self
+            .http
+            .get_text(&dir_url, &[("hl", "ja"), ("gl", "jp")])
+            .await?;
+
+        let rel = extract_preview_url(&html)
+            .ok_or_else(|| RouteError::Parse("no preview/directions link in dir HTML".into()))?;
+        let url = format!("https://www.google.com/{rel}");
+
+        let body = self.http.get_text(&url, &[]).await?;
+        let json_str = body.strip_prefix(")]}'").unwrap_or(&body).trim_start();
+        serde_json::from_str(json_str).map_err(|e| RouteError::Parse(format!("preview json: {e}")))
     }
 }
 
 #[async_trait::async_trait]
 impl RouteProvider for GoogleMapsScrape {
     async fn route(&self, from: LatLng, to: LatLng, mode: Mode) -> Result<RouteResult, RouteError> {
-        let e3 = match mode {
-            Mode::Car => "0",
-            Mode::Walk => "2",
-            Mode::Transit => "3",
-        };
-        let url = format!(
-            "https://www.google.com/maps/dir/{},{}/{},{}/data=!4m2!4m1!3e{}",
-            from.lat, from.lng, to.lat, to.lng, e3
-        );
+        let json = self.directions_json(from, to, mode).await?;
+        let trips = json
+            .pointer("/0/1")
+            .and_then(Value::as_array)
+            .filter(|t| !t.is_empty())
+            .ok_or(RouteError::NoRoute)?;
 
-        let html = self
-            .http
-            .get_text(&url, &[("hl", "ja"), ("gl", "jp")])
-            .await?;
-
-        let mut durations = extract_durations(&html);
-        durations.sort_unstable();
-        durations.dedup();
-        let durations: Vec<Duration> = durations
-            .into_iter()
-            .filter(|s| *s >= 30 && *s <= 6 * 3600)
-            .map(Duration::from_secs)
-            .collect();
-
-        let Some(&fastest) = durations.first() else {
-            return Err(RouteError::NoRoute);
-        };
-        let slowest = *durations.last().unwrap_or(&fastest);
-
-        let mut result = RouteResult {
-            mode,
-            provider: ProviderKind::GoogleScrape,
-            duration: fastest,
-            distance_m: None,
-            transit_fastest: (mode == Mode::Transit).then_some(fastest),
-            transit_slowest: (mode == Mode::Transit).then_some(slowest),
-            walk_ascent_m: None,
-            walk_descent_m: None,
-            itineraries: vec![Itinerary {
-                duration: fastest,
-                depart: None,
-                arrive: None,
-                fare_yen: None,
-                transfers: 0,
-                legs: Vec::new(),
-            }],
-        };
-
-        if mode == Mode::Walk {
-            let line = straight_line(from, to, 12);
-            if let Some(delta) = self.elevation.delta_for_path(&line).await {
-                result.walk_ascent_m = Some(delta.ascent_m);
-                result.walk_descent_m = Some(delta.descent_m);
+        match mode {
+            Mode::Transit => {
+                let mut its: Vec<Itinerary> = trips.iter().filter_map(parse_transit_trip).collect();
+                if its.is_empty() {
+                    return Err(RouteError::NoRoute);
+                }
+                its.sort_by_key(|i| i.duration);
+                let fastest = its.first().map(|i| i.duration).unwrap_or_default();
+                let slowest = its.last().map(|i| i.duration).unwrap_or(fastest);
+                Ok(RouteResult {
+                    mode,
+                    provider: ProviderKind::GoogleScrape,
+                    duration: fastest,
+                    distance_m: trip_distance_m(&trips[0]),
+                    transit_fastest: Some(fastest),
+                    transit_slowest: Some(slowest),
+                    walk_ascent_m: None,
+                    walk_descent_m: None,
+                    itineraries: its,
+                })
+            }
+            Mode::Walk | Mode::Car => {
+                let secs = trip_duration_s(&trips[0]).ok_or(RouteError::NoRoute)?;
+                let dur = Duration::from_secs(secs);
+                let mut out = RouteResult::single(
+                    mode,
+                    ProviderKind::GoogleScrape,
+                    Itinerary {
+                        duration: dur,
+                        depart: None,
+                        arrive: None,
+                        fare_yen: None,
+                        transfers: 0,
+                        legs: vec![if mode == Mode::Walk {
+                            Leg::Walk(WalkLeg {
+                                duration: dur,
+                                distance_m: trip_distance_m(&trips[0]),
+                                ascent_m: None,
+                                descent_m: None,
+                                polyline: None,
+                            })
+                        } else {
+                            Leg::Drive(DriveLeg {
+                                duration: dur,
+                                distance_m: trip_distance_m(&trips[0]),
+                                polyline: None,
+                            })
+                        }],
+                    },
+                );
+                out.distance_m = trip_distance_m(&trips[0]);
+                if mode == Mode::Walk {
+                    let line = straight_line(from, to, 12);
+                    if let Some(d) = self.elevation.delta_for_path(&line).await {
+                        out.walk_ascent_m = Some(d.ascent_m);
+                        out.walk_descent_m = Some(d.descent_m);
+                    }
+                }
+                Ok(out)
             }
         }
-
-        Ok(result)
     }
 }
 
-/// Collect duration candidates (in seconds) from the Maps HTML: both the
-/// numeric `[..,"1234s",..]` style tokens and visible "X時間Y分" / "X分" text.
-fn extract_durations(html: &str) -> Vec<u64> {
+// --- parsing -----------------------------------------------------------------
+
+fn extract_preview_url(html: &str) -> Option<String> {
+    let start = html.find("maps/preview/directions?")?;
+    let tail = &html[start..];
+    let end = tail.find(['"', '\'', '\\', ' ', '<']).unwrap_or(tail.len());
+    Some(tail[..end].replace("&amp;", "&"))
+}
+
+fn trip_duration_s(trip: &Value) -> Option<u64> {
+    trip.pointer("/0/3/0").and_then(Value::as_u64)
+}
+
+fn trip_distance_m(trip: &Value) -> Option<f64> {
+    trip.pointer("/0/2/0").and_then(Value::as_f64)
+}
+
+fn parse_transit_trip(trip: &Value) -> Option<Itinerary> {
+    let total = Duration::from_secs(trip_duration_s(trip)?);
+    let steps = trip.pointer("/1/0/1").and_then(Value::as_array)?;
+
+    let mut legs = Vec::new();
+    let mut transit_count = 0u32;
+    let (mut depart, mut arrive) = (None, None);
+
+    for step in steps {
+        let dur_txt = step
+            .pointer("/0/3/1")
+            .and_then(Value::as_str)
+            .unwrap_or("0 分");
+        let dur = Duration::from_secs(jp_minutes(dur_txt) * 60);
+
+        let is_transit = step.as_array().map(|a| a.len()).unwrap_or(0) >= 6
+            && step.pointer("/0/5/0/2").is_some();
+
+        if !is_transit {
+            legs.push(Leg::Walk(WalkLeg {
+                duration: dur,
+                distance_m: step.pointer("/0/2/1").and_then(Value::as_str).map(parse_m),
+                ascent_m: None,
+                descent_m: None,
+                polyline: None,
+            }));
+            continue;
+        }
+
+        transit_count += 1;
+        let dep = step
+            .pointer("/0/5/0/2")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let arr = step
+            .pointer("/0/5/1/2")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if depart.is_none() {
+            depart = dep.clone();
+        }
+        if arr.is_some() {
+            arrive = arr.clone();
+        }
+        let operator = step
+            .pointer("/0/6/4/0/0")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        let strings = collect_strings(step);
+        let line_name = strings
+            .iter()
+            .find(|s| s.ends_with('線'))
+            .cloned()
+            .unwrap_or_else(|| "路線不明".into());
+        let train_type = strings
+            .iter()
+            .find_map(|s| train_type(s))
+            .map(str::to_owned);
+        let stations: Vec<&String> = strings.iter().filter(|s| s.ends_with('駅')).collect();
+        let from_station = stations.first().map(|s| (*s).clone()).unwrap_or_default();
+        let to_station = stations.get(1).map(|s| (*s).clone()).unwrap_or_default();
+        let num_stops = (stations.len() as u32).saturating_sub(1).max(1).into();
+
+        legs.push(Leg::Transit(TransitLeg {
+            duration: dur,
+            distance_m: None,
+            line_name,
+            operator,
+            train_type,
+            vehicle: Some("train".into()),
+            headsign: None,
+            from_station,
+            to_station,
+            depart: dep,
+            arrive: arr,
+            num_stops,
+            color: None,
+        }));
+    }
+
+    Some(Itinerary {
+        duration: total,
+        depart,
+        arrive,
+        fare_yen: None,
+        transfers: transit_count.saturating_sub(1),
+        legs,
+    })
+}
+
+fn collect_strings(v: &Value) -> Vec<String> {
     let mut out = Vec::new();
-
-    // "<n>s" JSON tokens, e.g. `,"900s",` — Maps uses these for step durations.
-    let bytes = html.as_bytes();
-    let mut i = 0;
-    while let Some(p) = html[i..].find("s\"") {
-        let end = i + p; // index of 's'
-                         // walk back over digits
-        let mut start = end;
-        while start > 0 && bytes[start - 1].is_ascii_digit() {
-            start -= 1;
-        }
-        if start < end && bytes.get(start.wrapping_sub(1)) == Some(&b'"') {
-            if let Ok(n) = html[start..end].parse::<u64>() {
-                out.push(n);
+    fn go(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                if !s.is_empty() {
+                    out.push(s.clone());
+                }
             }
-        }
-        i = end + 1;
-    }
-
-    // Visible Japanese durations. Maps renders these as `[900,"15 分"]` /
-    // `[3900,"1 時間 5 分"]`, so look back generously and tolerate spaces.
-    for (idx, _) in html.match_indices('分') {
-        let start = floor_char_boundary(html, idx.saturating_sub(48));
-        if let Some(secs) = parse_jp_duration(&html[start..idx]) {
-            out.push(secs);
+            Value::Array(a) => a.iter().for_each(|x| go(x, out)),
+            Value::Object(o) => o.values().for_each(|x| go(x, out)),
+            _ => {}
         }
     }
-
+    go(v, &mut out);
     out
 }
 
-fn floor_char_boundary(s: &str, mut i: usize) -> usize {
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
+fn train_type(s: &str) -> Option<&'static str> {
+    const TYPES: &[&str] = &[
+        "特別快速",
+        "通勤特急",
+        "通勤急行",
+        "通勤快速",
+        "区間急行",
+        "区間快速",
+        "快速急行",
+        "特急",
+        "急行",
+        "準急",
+        "快速",
+        "各駅停車",
+        "普通",
+    ];
+    TYPES.iter().find(|t| s == **t).copied()
 }
 
-/// Parse a Japanese duration ending just before '分'. Handles "15", "15 分"'s
-/// whitespace, "1 時間 5", "1時間5". Returns seconds.
-fn parse_jp_duration(seg: &str) -> Option<u64> {
-    let tail: String = seg
-        .chars()
-        .rev()
-        .take_while(|c| {
-            c.is_ascii_digit() || *c == '時' || *c == '間' || *c == ' ' || *c == '\u{3000}'
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
+/// "26 分" / "1 時間 3 分" -> minutes.
+fn jp_minutes(s: &str) -> u64 {
+    let digits: Vec<u64> = s
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|p| p.parse().ok())
         .collect();
-    let cleaned: String = tail.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.is_empty() {
-        return None;
-    }
-    if let Some((h, m)) = cleaned.split_once("時間") {
-        let h: u64 = h.parse().ok()?;
-        let m: u64 = m.parse().unwrap_or(0);
-        Some(h * 3600 + m * 60)
-    } else if let Some(h) = cleaned.strip_suffix("時間") {
-        Some(h.parse::<u64>().ok()? * 3600)
+    if s.contains("時間") {
+        digits.first().copied().unwrap_or(0) * 60 + digits.get(1).copied().unwrap_or(0)
     } else {
-        Some(cleaned.parse::<u64>().ok()? * 60)
+        digits.first().copied().unwrap_or(0)
+    }
+}
+
+/// "1.8 km" / "170 m" -> metres.
+fn parse_m(s: &str) -> f64 {
+    let n: f64 = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0.0);
+    if s.contains("km") {
+        n * 1000.0
+    } else {
+        n
     }
 }
 
@@ -174,21 +326,62 @@ fn straight_line(a: LatLng, b: LatLng, n: usize) -> Vec<LatLng> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn reads_second_tokens_and_jp_text() {
-        let html = r#"junk,"540s",more ... 徒歩 約 1時間5分 かかります ... "900s" ... 25分"#;
-        let mut d = extract_durations(html);
-        d.sort_unstable();
-        assert!(d.contains(&540));
-        assert!(d.contains(&900));
-        assert!(d.contains(&(65 * 60)));
-        assert!(d.contains(&(25 * 60)));
+    fn load(name: &str) -> Value {
+        let raw = std::fs::read_to_string(format!("tests/fixtures/{name}")).unwrap();
+        let s = raw.strip_prefix(")]}'").unwrap_or(&raw).trim_start();
+        serde_json::from_str(s).unwrap()
     }
 
     #[test]
-    fn jp_duration_forms() {
-        assert_eq!(parse_jp_duration("所要 2時間3"), Some(2 * 3600 + 3 * 60));
-        assert_eq!(parse_jp_duration("およそ 45"), Some(45 * 60));
-        assert_eq!(parse_jp_duration("なし"), None);
+    fn transit_fixture() {
+        let json = load("gmaps_transit.json");
+        let trips = json.pointer("/0/1").unwrap().as_array().unwrap();
+        let its: Vec<_> = trips.iter().filter_map(parse_transit_trip).collect();
+        assert!(its.len() >= 3);
+
+        let fastest = its.iter().min_by_key(|i| i.duration).unwrap();
+        assert!(fastest.duration.as_secs() > 900 && fastest.duration.as_secs() < 4000);
+
+        let t: Vec<_> = fastest
+            .legs
+            .iter()
+            .filter_map(|l| match l {
+                Leg::Transit(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(!t.is_empty());
+        assert!(t.iter().any(|x| x.line_name.ends_with('線')));
+        assert!(t.iter().any(|x| x.from_station.ends_with('駅')));
+        assert!(t.iter().any(|x| x.operator.is_some()));
+        assert!(t.iter().any(|x| x.depart.is_some()));
+    }
+
+    #[test]
+    fn walk_fixture() {
+        let json = load("gmaps_walk.json");
+        let trips = json.pointer("/0/1").unwrap().as_array().unwrap();
+        assert_eq!(trip_duration_s(&trips[0]), Some(1551));
+        assert_eq!(trip_distance_m(&trips[0]), Some(1798.0));
+    }
+
+    #[test]
+    fn helpers() {
+        assert_eq!(jp_minutes("26 分"), 26);
+        assert_eq!(jp_minutes("1 時間 3 分"), 63);
+        assert_eq!(parse_m("1.8 km"), 1800.0);
+        assert_eq!(parse_m("170 m"), 170.0);
+        assert_eq!(train_type("急行"), Some("急行"));
+        assert_eq!(train_type("東急田園都市線"), None);
+    }
+
+    #[test]
+    fn extracts_preview_link() {
+        let html =
+            r#"<link href="/maps/preview/directions?authuser=0&amp;hl=ja&amp;pb=!1m4" rel="x">"#;
+        assert_eq!(
+            extract_preview_url(html).unwrap(),
+            "maps/preview/directions?authuser=0&hl=ja&pb=!1m4"
+        );
     }
 }

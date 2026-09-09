@@ -43,6 +43,8 @@ pub enum ProviderKind {
     Estimate,
     GoogleScrape,
     GoogleApi,
+    /// transit.yahoo.co.jp scrape — the transit transfer-guidance source.
+    YahooScrape,
 }
 
 impl ProviderKind {

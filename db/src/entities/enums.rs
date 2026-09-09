@@ -45,6 +45,7 @@ pub enum RouteProviderKind {
     Estimate,
     GoogleScrape,
     GoogleApi,
+    YahooScrape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]

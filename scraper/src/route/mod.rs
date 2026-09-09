@@ -38,8 +38,8 @@ pub trait RouteProvider: Send + Sync {
     async fn route(&self, from: LatLng, to: LatLng, mode: Mode) -> Result<RouteResult, RouteError>;
 }
 
-/// Build the standard chain from the environment: scrape first, then the API if
-/// a key is present. Walk elevation is filled in by GSI (free, no key) for both.
+/// The route chain. Per project direction, transit detail comes from Google
+/// Maps scraping only; the API is a last-resort fallback if a key is set.
 pub fn default_provider(http: HttpClient, google_api_key: Option<String>) -> FallbackProvider {
     let elevation = GsiElevation::new(http.clone());
     let mut chain: Vec<Box<dyn RouteProvider>> = vec![Box::new(GoogleMapsScrape::new(
@@ -115,5 +115,6 @@ fn provider_to_db(p: ProviderKind) -> RouteProviderKind {
         ProviderKind::Estimate => RouteProviderKind::Estimate,
         ProviderKind::GoogleScrape => RouteProviderKind::GoogleScrape,
         ProviderKind::GoogleApi => RouteProviderKind::GoogleApi,
+        ProviderKind::YahooScrape => RouteProviderKind::YahooScrape,
     }
 }

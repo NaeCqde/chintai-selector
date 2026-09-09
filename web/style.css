@@ -107,3 +107,6 @@ button.link { background: none; border: none; color: var(--accent); padding: 0; 
     }
     .map-pane { position: absolute; inset: 0; }
 }
+
+.search-bar .tiny{font-size:11px;margin:4px 0 0}
+.station{font-size:12px;margin:6px 0 0}

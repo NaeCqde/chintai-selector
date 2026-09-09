@@ -389,23 +389,12 @@ fn SearchBar() -> impl IntoView {
         });
     };
 
-    let form = state.form;
     view! {
         <div class="search-bar">
             <button class="primary" on:click=run disabled=move || state.loading.get()>
-                {move || if state.loading.get() { "検索中…" } else { "物件を検索" }}
+                {move || if state.loading.get() { "検索中… (初回は経路取得で数十秒)" } else { "物件を検索" }}
             </button>
-            <label class="checkbox">
-                <input
-                    type="checkbox"
-                    prop:checked=move || form.with(|f| f.refine)
-                    on:change=move |ev| {
-                        let c = event_target_checked(&ev);
-                        form.update(|f| f.refine = c);
-                    }
-                />
-                "上位の経路を正確に取得（乗換案内・数十秒）"
-            </label>
+            <p class="muted tiny">"上位10件は Google マップの経路（乗換案内・最寄り駅までの徒歩）を取得します。初回は時間がかかります。"</p>
             {move || state.error.get().map(|e| view! { <p class="err">{e}</p> })}
             {move || state.results.get().map(|r| view! {
                 <p class="muted">
@@ -476,6 +465,13 @@ fn ResultCard(r: chintai_types::RankedProperty) -> impl IntoView {
                     view! { <a href=url target="_blank" rel="noreferrer">{site}</a> }
                 }).collect_view()}
             </div>
+
+            {r.nearest_station.clone().map(|st| view! {
+                <p class="station">
+                    "🚉 " {st.name.clone()} " 徒歩" {st.walk_minutes} "分"
+                    <span class="muted">" ("{format!("{:.0}m", st.distance_m)}", Googleマップ)"</span>
+                </p>
+            })}
 
             <ul class="places">
                 {places.into_iter().map(|pa| view! {

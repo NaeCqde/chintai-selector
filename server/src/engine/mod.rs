@@ -42,6 +42,21 @@ fn reachable_ceiling_m(mode: chintai_scraper::route::Mode, minutes: u32) -> f64 
     minutes as f64 * per_min + 400.0 // + slack for the last-leg walk
 }
 
+fn nearest_station(
+    lat: f64,
+    lng: f64,
+    stations: &[entities::station::Model],
+) -> Option<&entities::station::Model> {
+    stations
+        .iter()
+        .min_by(|a, b| {
+            haversine_m(lat, lng, a.lat, a.lng)
+                .partial_cmp(&haversine_m(lat, lng, b.lat, b.lng))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .filter(|s| haversine_m(lat, lng, s.lat, s.lng) < 3_000.0)
+}
+
 fn straight_line_sum(c: &Candidate, places: &[PlaceSpec]) -> f64 {
     let (lat, lng) = (c.prop.lat.unwrap(), c.prop.lng.unwrap());
     places
@@ -57,9 +72,11 @@ pub struct Engine<'a> {
     pub provider: &'a dyn RouteProvider,
 }
 
-/// Top-N results that get a real (networked) route + transfer detail after the
-/// estimate pass. Kept small so a keyless search stays interactive.
-const REFINE_CAP: usize = 12;
+/// Top-N results that get real Google Maps routes (accurate times + transit
+/// transfer detail + walk-to-station) after the estimate pass ranks
+/// everything. The first uncached search of this many takes ~20-40s; results
+/// are then in `route_cache`.
+const REFINE_CAP: usize = 10;
 
 impl<'a> Engine<'a> {
     pub fn new(db: &'a DatabaseConnection, provider: &'a dyn RouteProvider) -> Self {
@@ -84,6 +101,7 @@ impl<'a> Engine<'a> {
 
         let stores = chintai_db::stores_with_brand(self.db).await?;
         let deliveries = chintai_db::deliveries_with_coords(self.db).await?;
+        let stations = chintai_db::stations_all(self.db).await?;
 
         let mut candidates: Vec<Candidate> = Vec::new();
         for (_, (prop, units)) in by_prop {
@@ -179,7 +197,11 @@ impl<'a> Engine<'a> {
                         route,
                     });
                 }
-                all_ok.then_some(RoutedCandidate { c, places })
+                all_ok.then_some(RoutedCandidate {
+                    c,
+                    places,
+                    nearest_station: None,
+                })
             }
         }))
         .buffer_unordered(64)
@@ -208,14 +230,14 @@ impl<'a> Engine<'a> {
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(req.limit as usize);
 
-        // --- 3b. optionally refine the top few with the real provider -----
-        // (accurate times + transfer detail). Bounded so a keyless search
-        // stays interactive; the rest keep their estimate.
-        for (_, rc, _) in scored
-            .iter_mut()
-            .take(if req.refine { REFINE_CAP } else { 0 })
-        {
+        // --- 3b. refine the shown results with real Google Maps routes ----
+        // Accurate times + transit transfer detail for every place, plus the
+        // Google-Maps walk time to the listing's nearest station. Bounded so
+        // the first (uncached) search stays under a minute; the rest keep
+        // their estimate.
+        for (_, rc, _) in scored.iter_mut().take(REFINE_CAP) {
             let origin = LatLng::new(rc.c.prop.lat.unwrap(), rc.c.prop.lng.unwrap());
+
             for (pa, place) in rc.places.iter_mut().zip(&req.places) {
                 let dest = LatLng::new(place.lat, place.lng);
                 if let Ok(real) =
@@ -225,6 +247,30 @@ impl<'a> Engine<'a> {
                     pa.within_limit = pa.minutes <= place.max_minutes;
                     pa.route = real;
                 }
+            }
+
+            if let Some(st) =
+                nearest_station(rc.c.prop.lat.unwrap(), rc.c.prop.lng.unwrap(), &stations)
+            {
+                let dest = LatLng::new(st.lat, st.lng);
+                let dist = haversine_m(origin.lat, origin.lng, st.lat, st.lng);
+                let walk_min = match route_cached(
+                    self.db,
+                    self.provider,
+                    origin,
+                    dest,
+                    chintai_scraper::route::Mode::Walk,
+                )
+                .await
+                {
+                    Ok(r) => (r.duration.as_secs() as f64 / 60.0).ceil() as u32,
+                    Err(_) => geo::walk_minutes(dist),
+                };
+                rc.nearest_station = Some(NearestStation {
+                    name: st.name.clone(),
+                    walk_minutes: walk_min,
+                    distance_m: dist,
+                });
             }
         }
 
@@ -250,7 +296,11 @@ impl<'a> Engine<'a> {
         score: f64,
         rc: RoutedCandidate,
     ) -> anyhow::Result<RankedProperty> {
-        let RoutedCandidate { c, places } = rc;
+        let RoutedCandidate {
+            c,
+            places,
+            nearest_station,
+        } = rc;
         let mut units = c.units;
         units.sort_by_key(|u| u.rent_yen.unwrap_or(i32::MAX));
 
@@ -281,6 +331,7 @@ impl<'a> Engine<'a> {
             best_unit,
             other_units: views,
             places,
+            nearest_station,
             nearest_conveni_m: c.near.conveni_m,
             nearest_super_m: c.near.super_m,
             nearest_cheap_super_m: c.near.cheap_super_m,
@@ -300,6 +351,7 @@ struct Candidate {
 struct RoutedCandidate {
     c: Candidate,
     places: Vec<PlaceAccess>,
+    nearest_station: Option<NearestStation>,
 }
 
 #[derive(Default)]
