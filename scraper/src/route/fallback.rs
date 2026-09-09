@@ -35,12 +35,18 @@ fn is_sufficient(r: &RouteResult) -> bool {
 
 #[async_trait::async_trait]
 impl RouteProvider for FallbackProvider {
-    async fn route(&self, from: LatLng, to: LatLng, mode: Mode) -> Result<RouteResult, RouteError> {
+    async fn route(
+        &self,
+        from: LatLng,
+        to: LatLng,
+        mode: Mode,
+        departure: Option<DepartureTime>,
+    ) -> Result<RouteResult, RouteError> {
         let mut best_partial: Option<RouteResult> = None;
         let mut last_err: Option<RouteError> = None;
 
         for p in &self.providers {
-            match p.route(from, to, mode).await {
+            match p.route(from, to, mode, departure).await {
                 Ok(r) if is_sufficient(&r) => return Ok(r),
                 Ok(r) => {
                     log::info!(

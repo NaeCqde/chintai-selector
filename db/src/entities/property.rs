@@ -23,8 +23,19 @@ pub struct Model {
     pub station_name: Option<String>,
     /// Real walking time from a Google Maps route, filled in by
     /// `ingest google-stations`. `None` until that batch reaches this row.
+    /// `-1` = attempted but the station name didn't resolve in our DB.
     pub station_walk_min: Option<i32>,
     pub station_distance_m: Option<f64>,
+    /// Real driving time from a Google Maps route, filled in by the same
+    /// `ingest google-stations` pass. Used for 送迎モード (`Mode::PickupTransit`
+    /// — someone drives you to the station, then transit from there): this
+    /// is that first leg, never computed live. Same `-1` sentinel.
+    pub station_car_min: Option<i32>,
+    /// The resolved station's own coordinates, cached here so the engine can
+    /// build 送迎モード's second leg (station -> place, live transit) without
+    /// a `station` table lookup at search time.
+    pub station_lat: Option<f64>,
+    pub station_lng: Option<f64>,
     pub updated_at: DateTimeUtc,
 }
 

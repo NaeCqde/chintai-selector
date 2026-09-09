@@ -225,9 +225,9 @@ pub async fn upsert_property(
             // heuristic / geocoder / this insert) and deliberately excluded
             // here: a rental re-crawl always passes `lat: None` on this path,
             // and including them would null out coordinates set afterward by
-            // `set_property_coords`. `station_walk_min`/`station_distance_m`
-            // are never touched by this function at all (see
-            // `set_property_station_time`).
+            // `set_property_coords`. `station_walk_min`/`station_distance_m`/
+            // `station_car_min`/`station_lat`/`station_lng` are never touched
+            // by this function at all (see `set_property_station_time`).
             .update_columns([
                 property::Column::BuildingType,
                 property::Column::BuiltYear,
@@ -402,16 +402,68 @@ pub async fn properties_needing_station_time(
         .await
 }
 
+/// Properties whose walk leg resolved *before* car-time / station-coordinate
+/// support existed (so `station_walk_min` is a real, non-negative value but
+/// `station_car_min` is still untouched) — the catch-up queue so an
+/// already-running crawl doesn't leave a permanent backlog when this feature
+/// lands mid-crawl.
+pub async fn properties_needing_station_car_backfill(
+    db: &DatabaseConnection,
+    limit: u64,
+) -> Result<Vec<property::Model>, DbErr> {
+    property::Entity::find()
+        .filter(property::Column::StationName.is_not_null())
+        .filter(property::Column::StationName.ne(""))
+        .filter(property::Column::StationWalkMin.gte(0))
+        .filter(property::Column::StationCarMin.is_null())
+        .filter(property::Column::Lat.is_not_null())
+        .order_by_asc(property::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
+/// Fills in just the car leg (+ station coordinates) for a property whose
+/// walk leg is already resolved — see `properties_needing_station_car_backfill`.
+pub async fn set_property_station_car(
+    db: &DatabaseConnection,
+    id: i32,
+    car_min: Option<i32>,
+    station_lat: f64,
+    station_lng: f64,
+) -> Result<(), DbErr> {
+    property::Entity::update(property::ActiveModel {
+        id: Set(id),
+        station_car_min: Set(car_min),
+        station_lat: Set(Some(station_lat)),
+        station_lng: Set(Some(station_lng)),
+        updated_at: Set(now()),
+        ..Default::default()
+    })
+    .exec(db)
+    .await?;
+    Ok(())
+}
+
+/// `car_min`: `None` if the car leg wasn't attempted (e.g. an older run, or a
+/// transient failure — distinct from `Some(-1)`, "attempted and failed").
+#[allow(clippy::too_many_arguments)]
 pub async fn set_property_station_time(
     db: &DatabaseConnection,
     id: i32,
     walk_min: i32,
     distance_m: Option<f64>,
+    car_min: Option<i32>,
+    station_lat: f64,
+    station_lng: f64,
 ) -> Result<(), DbErr> {
     property::Entity::update(property::ActiveModel {
         id: Set(id),
         station_walk_min: Set(Some(walk_min)),
         station_distance_m: Set(distance_m),
+        station_car_min: Set(car_min),
+        station_lat: Set(Some(station_lat)),
+        station_lng: Set(Some(station_lng)),
         updated_at: Set(now()),
         ..Default::default()
     })
@@ -472,6 +524,7 @@ pub async fn mark_property_station_unresolved(
     property::Entity::update(property::ActiveModel {
         id: Set(id),
         station_walk_min: Set(Some(-1)),
+        station_car_min: Set(Some(-1)),
         updated_at: Set(now()),
         ..Default::default()
     })
@@ -618,6 +671,10 @@ pub struct RouteCacheKey {
     pub to_lat: f64,
     pub to_lng: f64,
     pub mode: TravelMode,
+    /// Departure time-of-day bucketed to 30 minutes (minutes since midnight
+    /// JST), or `None` for "no departure time requested". See the doc on
+    /// `route_cache::Model::departure_bucket`.
+    pub departure_bucket: Option<i32>,
 }
 
 impl RouteCacheKey {
@@ -643,12 +700,16 @@ pub struct RouteCacheValue {
 
 fn route_cache_query(key: &RouteCacheKey) -> Select<route_cache::Entity> {
     let k = key.clone().rounded();
-    route_cache::Entity::find()
+    let q = route_cache::Entity::find()
         .filter(route_cache::Column::FromLat.eq(k.from_lat))
         .filter(route_cache::Column::FromLng.eq(k.from_lng))
         .filter(route_cache::Column::ToLat.eq(k.to_lat))
         .filter(route_cache::Column::ToLng.eq(k.to_lng))
-        .filter(route_cache::Column::Mode.eq(k.mode))
+        .filter(route_cache::Column::Mode.eq(k.mode));
+    match k.departure_bucket {
+        Some(b) => q.filter(route_cache::Column::DepartureBucket.eq(b)),
+        None => q.filter(route_cache::Column::DepartureBucket.is_null()),
+    }
 }
 
 pub async fn route_cache_get(
@@ -670,6 +731,7 @@ pub async fn route_cache_put(
         to_lat: Set(k.to_lat),
         to_lng: Set(k.to_lng),
         mode: Set(k.mode),
+        departure_bucket: Set(k.departure_bucket),
         duration_sec: Set(val.duration_sec),
         transit_fastest_sec: Set(val.transit_fastest_sec),
         transit_slowest_sec: Set(val.transit_slowest_sec),
@@ -687,6 +749,7 @@ pub async fn route_cache_put(
             route_cache::Column::ToLat,
             route_cache::Column::ToLng,
             route_cache::Column::Mode,
+            route_cache::Column::DepartureBucket,
         ])
         .update_columns([
             route_cache::Column::DurationSec,

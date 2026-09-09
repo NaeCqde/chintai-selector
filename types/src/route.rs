@@ -24,6 +24,15 @@ pub enum Mode {
     Walk,
     Car,
     Transit,
+    /// 送迎モード: someone drives you from the property to its nearest
+    /// station (the precomputed `station_car_min` leg — never a live route
+    /// call), then public transit from that station onward. Only the engine
+    /// (`server/src/engine`) understands this — it is decomposed into the
+    /// two legs before anything reaches a [`crate::route`]-provider-style
+    /// backend, so no `RouteProvider` implementation ever receives it in
+    /// practice; every match on `Mode` still needs an arm for it, and those
+    /// treat it like `Transit` as a defensive fallback.
+    PickupTransit,
 }
 
 impl Mode {
@@ -32,6 +41,7 @@ impl Mode {
             Mode::Walk => "徒歩",
             Mode::Car => "車",
             Mode::Transit => "公共交通",
+            Mode::PickupTransit => "送迎(車)+公共交通",
         }
     }
 }
@@ -48,6 +58,42 @@ pub enum ProviderKind {
 impl ProviderKind {
     pub fn is_estimate(self) -> bool {
         matches!(self, ProviderKind::Estimate)
+    }
+}
+
+/// A local wall-clock time-of-day (24h) to bias a route search by — transit
+/// timetables differ a lot between rush hour and midday. Only the Google
+/// Routes API backend (`GOOGLE_MAPS_API_KEY` set) can currently honour this:
+/// the Google-Maps-scrape path has no reliable way to request a specific
+/// departure time (tried the documented `!6e/!7e/!8j` and `!19m2!2e/!3j`
+/// URL parameters against live Google Maps; neither changed the computed
+/// itinerary), so it always computes "depart now" regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepartureTime {
+    /// 0..=23.
+    pub hour: u8,
+    /// 0..=59.
+    pub minute: u8,
+}
+
+impl DepartureTime {
+    pub fn new(hour: u8, minute: u8) -> Self {
+        Self {
+            hour: hour.min(23),
+            minute: minute.min(59),
+        }
+    }
+
+    pub fn hhmm(self) -> String {
+        format!("{:02}:{:02}", self.hour, self.minute)
+    }
+
+    /// This time plus `mins` minutes, wrapping across midnight. Used for
+    /// 送迎モード's second leg: "depart the station after the drive there
+    /// takes `mins` minutes."
+    pub fn plus_minutes(self, mins: i64) -> Self {
+        let total = (self.hour as i64 * 60 + self.minute as i64 + mins).rem_euclid(24 * 60);
+        Self::new((total / 60) as u8, (total % 60) as u8)
     }
 }
 
@@ -114,6 +160,25 @@ impl RouteResult {
             walk_descent_m: None,
             itineraries: vec![it],
         }
+    }
+
+    /// A placeholder for "we don't have enough data to route this yet" (e.g.
+    /// 送迎モード before `ingest google-stations` has resolved a property's
+    /// car-to-station leg) — a deliberately huge duration so it always fails
+    /// a `max_minutes` check rather than being silently treated as reachable.
+    pub fn unresolvable(mode: Mode) -> Self {
+        Self::single(
+            mode,
+            ProviderKind::Estimate,
+            Itinerary {
+                duration: Duration::from_secs(999_999),
+                depart: None,
+                arrive: None,
+                fare_yen: None,
+                transfers: 0,
+                legs: Vec::new(),
+            },
+        )
     }
 }
 

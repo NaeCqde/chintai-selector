@@ -37,7 +37,7 @@ async fn gsi_elevation_reports_a_delta() {
 async fn scrape_walk_duration_is_plausible() {
     let http = HttpClient::default();
     let p = GoogleMapsScrape::new(http.clone(), GsiElevation::new(http));
-    match p.route(SHIBUYA, EBISU, Mode::Walk).await {
+    match p.route(SHIBUYA, EBISU, Mode::Walk, None).await {
         Ok(r) => {
             eprintln!(
                 "walk {}s  asc={:?} desc={:?}",
@@ -57,7 +57,7 @@ async fn scrape_walk_duration_is_plausible() {
 async fn scrape_transit_returns_totals() {
     let http = HttpClient::default();
     let p = GoogleMapsScrape::new(http.clone(), GsiElevation::new(http));
-    match p.route(SHIBUYA, EBISU, Mode::Transit).await {
+    match p.route(SHIBUYA, EBISU, Mode::Transit, None).await {
         Ok(r) => eprintln!(
             "transit fastest={:?} slowest={:?}",
             r.transit_fastest, r.transit_slowest

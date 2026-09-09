@@ -37,21 +37,35 @@ impl GoogleRoutesApi {
 
 #[async_trait::async_trait]
 impl RouteProvider for GoogleRoutesApi {
-    async fn route(&self, from: LatLng, to: LatLng, mode: Mode) -> Result<RouteResult, RouteError> {
+    async fn route(
+        &self,
+        from: LatLng,
+        to: LatLng,
+        mode: Mode,
+        departure: Option<DepartureTime>,
+    ) -> Result<RouteResult, RouteError> {
         let travel_mode = match mode {
             Mode::Walk => "WALK",
             Mode::Car => "DRIVE",
-            Mode::Transit => "TRANSIT",
+            Mode::Transit | Mode::PickupTransit => "TRANSIT",
         };
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "origin": { "location": { "latLng": { "latitude": from.lat, "longitude": from.lng } } },
             "destination": { "location": { "latLng": { "latitude": to.lat, "longitude": to.lng } } },
             "travelMode": travel_mode,
-            "computeAlternativeRoutes": mode == Mode::Transit,
+            "computeAlternativeRoutes": matches!(mode, Mode::Transit | Mode::PickupTransit),
             "languageCode": "ja",
             "regionCode": "JP",
             "units": "METRIC",
         });
+        // Officially documented (unlike the scrape path — see
+        // `GoogleMapsScrape`'s doc comment): the Routes API takes an RFC3339
+        // departure time directly. "Next occurrence of this JST wall-clock
+        // time" — no weekday/holiday awareness, which is a known
+        // simplification.
+        if let Some(d) = departure {
+            body["departureTime"] = serde_json::Value::String(next_departure_rfc3339(d));
+        }
 
         let resp: RoutesResponse = self
             .http
@@ -83,8 +97,12 @@ impl RouteProvider for GoogleRoutesApi {
             provider: ProviderKind::GoogleApi,
             duration: fastest.unwrap_or_default(),
             distance_m: resp.routes[0].distance_meters.map(|m| m as f64),
-            transit_fastest: (mode == Mode::Transit).then_some(fastest).flatten(),
-            transit_slowest: (mode == Mode::Transit).then_some(slowest).flatten(),
+            transit_fastest: matches!(mode, Mode::Transit | Mode::PickupTransit)
+                .then_some(fastest)
+                .flatten(),
+            transit_slowest: matches!(mode, Mode::Transit | Mode::PickupTransit)
+                .then_some(slowest)
+                .flatten(),
             walk_ascent_m: None,
             walk_descent_m: None,
             itineraries,
@@ -194,6 +212,27 @@ fn fold_walks(legs: Vec<Leg>) -> Vec<Leg> {
 
 fn parse_secs(s: &str) -> Duration {
     Duration::from_secs(s.trim_end_matches('s').parse().unwrap_or(0))
+}
+
+/// The next occurrence (today if still ahead, otherwise tomorrow) of `d`'s
+/// wall-clock time in JST (fixed UTC+9 — Japan has no DST), as an RFC3339 UTC
+/// timestamp for the Routes API's `departureTime` field. No weekday/holiday
+/// awareness: a "commute" place always means "the next time it's this hour",
+/// even if that lands on a weekend.
+fn next_departure_rfc3339(d: DepartureTime) -> String {
+    use chrono::{Duration as ChronoDuration, FixedOffset, NaiveTime, TimeZone, Utc};
+    let jst = FixedOffset::east_opt(9 * 3600).expect("valid fixed offset");
+    let now_jst = Utc::now().with_timezone(&jst);
+    let target = NaiveTime::from_hms_opt(d.hour as u32, d.minute as u32, 0)
+        .unwrap_or_else(|| NaiveTime::from_hms_opt(12, 0, 0).unwrap());
+    let mut candidate = jst
+        .from_local_datetime(&now_jst.date_naive().and_time(target))
+        .single()
+        .unwrap_or(now_jst);
+    if candidate <= now_jst {
+        candidate += ChronoDuration::days(1);
+    }
+    candidate.with_timezone(&Utc).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// "2026-09-08T09:41:00Z" / with offset -> "09:41". Best effort.

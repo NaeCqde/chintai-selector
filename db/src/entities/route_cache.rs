@@ -18,6 +18,12 @@ pub struct Model {
     pub to_lat: f64,
     pub to_lng: f64,
     pub mode: TravelMode,
+    /// Departure time-of-day, bucketed to 30 minutes (minutes since
+    /// midnight JST) — part of the cache key so a commute-hour query and a
+    /// midday query for the same trip don't collide. `NULL` means "no
+    /// departure time was requested" (only ever set by callers that pass
+    /// `None`, e.g. the property->station precompute).
+    pub departure_bucket: Option<i32>,
     pub duration_sec: i32,
     pub transit_fastest_sec: Option<i32>,
     pub transit_slowest_sec: Option<i32>,

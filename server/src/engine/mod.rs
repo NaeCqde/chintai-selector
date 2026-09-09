@@ -16,10 +16,13 @@ mod types;
 pub use types::*;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use chintai_db::entities::enums::PriceTier;
 use chintai_db::{entities, DatabaseConnection};
-use chintai_scraper::route::{route_cached, EstimateProvider, LatLng, RouteProvider};
+use chintai_scraper::route::{
+    route_cached, DriveLeg, EstimateProvider, LatLng, Leg, Mode, RouteProvider, RouteResult,
+};
 use futures::stream::{self, StreamExt};
 
 use geo::{haversine_m, walk_minutes};
@@ -35,8 +38,11 @@ const ROUTE_CAP: usize = 60;
 fn reachable_ceiling_m(mode: chintai_scraper::route::Mode, minutes: u32) -> f64 {
     use chintai_scraper::route::Mode;
     let per_min = match mode {
-        Mode::Walk => 100.0,    // ~6 km/h
-        Mode::Car => 1_000.0,   // ~60 km/h
+        Mode::Walk => 100.0,  // ~6 km/h
+        Mode::Car => 1_000.0, // ~60 km/h
+        // Car to the station is fast, so a bit more generous than plain
+        // transit's ceiling.
+        Mode::PickupTransit => 1_000.0,
         Mode::Transit => 900.0, // ~54 km/h incl. access/wait, generous
     };
     minutes as f64 * per_min + 400.0 // + slack for the last-leg walk
@@ -56,6 +62,44 @@ fn nearest_station_of(prop: &entities::property::Model) -> Option<NearestStation
         walk_minutes: walk_minutes as u32,
         distance_m: prop.station_distance_m.unwrap_or_default(),
     })
+}
+
+/// 送迎モード's fixed first leg: someone drives the property's own precomputed
+/// station car-time (`ingest google-stations`), never a live route call.
+/// `None` until that batch has resolved *both* the walk and car legs for this
+/// property (see `set_property_station_time`'s doc), or if the car leg
+/// specifically failed (`car_min == -1` or `None`).
+fn station_car_leg(prop: &entities::property::Model) -> Option<(u32, LatLng)> {
+    let car_min = prop.station_car_min?;
+    if car_min < 0 {
+        return None;
+    }
+    let lat = prop.station_lat?;
+    let lng = prop.station_lng?;
+    Some((car_min as u32, LatLng::new(lat, lng)))
+}
+
+/// Splice 送迎モード's fixed car-to-station leg onto the front of a live
+/// station->place transit result: bumps every duration field and prepends a
+/// synthetic drive leg to each itinerary.
+fn prepend_drive_leg(leg1_minutes: u32, mut leg2: RouteResult) -> RouteResult {
+    let leg1_dur = Duration::from_secs(leg1_minutes as u64 * 60);
+    leg2.mode = Mode::PickupTransit;
+    leg2.duration += leg1_dur;
+    leg2.transit_fastest = leg2.transit_fastest.map(|d| d + leg1_dur);
+    leg2.transit_slowest = leg2.transit_slowest.map(|d| d + leg1_dur);
+    for it in &mut leg2.itineraries {
+        it.duration += leg1_dur;
+        it.legs.insert(
+            0,
+            Leg::Drive(DriveLeg {
+                duration: leg1_dur,
+                distance_m: None,
+                polyline: None,
+            }),
+        );
+    }
+    leg2
 }
 
 fn straight_line_sum(c: &Candidate, places: &[PlaceSpec]) -> f64 {
@@ -183,10 +227,31 @@ impl<'a> Engine<'a> {
                 let mut all_ok = true;
                 for place in &req.places {
                     let dest = LatLng::new(place.lat, place.lng);
-                    let route = estimator
-                        .route(origin, dest, place.mode)
-                        .await
-                        .expect("estimate is infallible");
+                    let route = if place.mode == Mode::PickupTransit {
+                        match station_car_leg(&c.prop) {
+                            Some((car_min, station)) => {
+                                let leg2 = estimator
+                                    .route(
+                                        station,
+                                        dest,
+                                        Mode::Transit,
+                                        Some(place.departure.plus_minutes(car_min as i64)),
+                                    )
+                                    .await
+                                    .expect("estimate is infallible");
+                                prepend_drive_leg(car_min, leg2)
+                            }
+                            // Car-to-station leg not precomputed yet for this
+                            // property (see `station_car_leg`'s doc) — don't
+                            // fabricate a number, just fail this place.
+                            None => RouteResult::unresolvable(place.mode),
+                        }
+                    } else {
+                        estimator
+                            .route(origin, dest, place.mode, Some(place.departure))
+                            .await
+                            .expect("estimate is infallible")
+                    };
                     let minutes = (route.duration.as_secs() as f64 / 60.0).ceil() as u32;
                     let within = minutes <= place.max_minutes;
                     all_ok &= within;
@@ -236,9 +301,39 @@ impl<'a> Engine<'a> {
             let origin = LatLng::new(rc.c.prop.lat.unwrap(), rc.c.prop.lng.unwrap());
             for (pa, place) in rc.places.iter_mut().zip(&req.places) {
                 let dest = LatLng::new(place.lat, place.lng);
-                if let Ok(real) =
-                    route_cached(self.db, self.provider, origin, dest, place.mode).await
-                {
+
+                let real = if place.mode == Mode::PickupTransit {
+                    // Leg 1 (property -> station, car) is fixed, precomputed
+                    // data — never a live call. Leg 2 (station -> place,
+                    // transit) is refined live like any other place, just
+                    // from the station instead of the property, departing
+                    // after the drive.
+                    match station_car_leg(&rc.c.prop) {
+                        Some((car_min, station)) => route_cached(
+                            self.db,
+                            self.provider,
+                            station,
+                            dest,
+                            Mode::Transit,
+                            Some(place.departure.plus_minutes(car_min as i64)),
+                        )
+                        .await
+                        .map(|leg2| prepend_drive_leg(car_min, leg2)),
+                        None => Ok(RouteResult::unresolvable(place.mode)),
+                    }
+                } else {
+                    route_cached(
+                        self.db,
+                        self.provider,
+                        origin,
+                        dest,
+                        place.mode,
+                        Some(place.departure),
+                    )
+                    .await
+                };
+
+                if let Ok(real) = real {
                     pa.minutes = (real.duration.as_secs() as f64 / 60.0).ceil() as u32;
                     pa.within_limit = pa.minutes <= place.max_minutes;
                     pa.route = real;

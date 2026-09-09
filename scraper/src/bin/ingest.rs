@@ -339,11 +339,38 @@ async fn google_stations_cmd(
 
     let http = HttpClient::default();
     let provider = GoogleMapsScrape::new(http.clone(), GsiElevation::new(http));
+    let run = chintai_db::ingest_run_start(db, "google-stations").await?;
+    let (mut ok, mut miss, mut unresolved) = (0u64, 0u64, 0u64);
+
+    // Catch-up pass: properties whose walk leg resolved before car-time /
+    // station-coordinate support existed (added after this crawl was
+    // already running against ~150k properties — without this, everything
+    // resolved so far would be permanently stuck missing car_min).
+    let car_backfill = chintai_db::properties_needing_station_car_backfill(db, limit).await?;
+    log::info!(
+        "google-stations: {} properties need car-time backfill",
+        car_backfill.len()
+    );
+    for p in &car_backfill {
+        let Some(name) = &p.station_name else { continue };
+        let Some(station) = chintai_db::station_by_name(db, name).await? else {
+            continue;
+        };
+        let origin = LatLng::new(p.lat.unwrap(), p.lng.unwrap());
+        let dest = LatLng::new(station.lat, station.lng);
+        let car_min = match provider.route(origin, dest, Mode::Car, None).await {
+            Ok(car_route) => Some((car_route.duration.as_secs() as f64 / 60.0).ceil() as i32),
+            Err(e) => {
+                log::warn!("google-stations backfill: {} -> {name} (car): {e}", p.name);
+                None
+            }
+        };
+        chintai_db::set_property_station_car(db, p.id, car_min, station.lat, station.lng).await?;
+        ok += 1;
+    }
 
     let pending = chintai_db::properties_needing_station_time(db, limit).await?;
     log::info!("google-stations: {} properties pending", pending.len());
-    let run = chintai_db::ingest_run_start(db, "google-stations").await?;
-    let (mut ok, mut miss, mut unresolved) = (0u64, 0u64, 0u64);
 
     for p in &pending {
         let Some(name) = &p.station_name else {
@@ -356,14 +383,41 @@ async fn google_stations_cmd(
         };
         let origin = LatLng::new(p.lat.unwrap(), p.lng.unwrap());
         let dest = LatLng::new(station.lat, station.lng);
-        match provider.route(origin, dest, Mode::Walk).await {
-            Ok(route) => {
-                let mins = (route.duration.as_secs() as f64 / 60.0).ceil() as i32;
-                chintai_db::set_property_station_time(db, p.id, mins, route.distance_m).await?;
+
+        // Walk is required (it's what leaves the pending set); car (for
+        // 送迎モード) is best-effort alongside it. If car fails while walk
+        // succeeds, the row is still marked resolved with `car_min = None`
+        // and won't be retried — a known gap, acceptable since both legs hit
+        // the same reliable scrape path and a car-only failure should be
+        // rare. A dedicated car-only backfill pass can be added later if
+        // that turns out wrong.
+        let walk = provider.route(origin, dest, Mode::Walk, None).await;
+        match walk {
+            Ok(walk_route) => {
+                let walk_min = (walk_route.duration.as_secs() as f64 / 60.0).ceil() as i32;
+                let car_min = match provider.route(origin, dest, Mode::Car, None).await {
+                    Ok(car_route) => {
+                        Some((car_route.duration.as_secs() as f64 / 60.0).ceil() as i32)
+                    }
+                    Err(e) => {
+                        log::warn!("google-stations: {} -> {name} (car): {e}", p.name);
+                        None
+                    }
+                };
+                chintai_db::set_property_station_time(
+                    db,
+                    p.id,
+                    walk_min,
+                    walk_route.distance_m,
+                    car_min,
+                    station.lat,
+                    station.lng,
+                )
+                .await?;
                 ok += 1;
             }
             Err(e) => {
-                log::warn!("google-stations: {} -> {name}: {e}", p.name);
+                log::warn!("google-stations: {} -> {name} (walk): {e}", p.name);
                 miss += 1;
             }
         }

@@ -1,8 +1,38 @@
 //! Request / response shapes for the ranking engine. All `Serialize`/
 //! `Deserialize` so they cross the Leptos server-function boundary unchanged.
 
-use crate::route::{Mode, RouteResult};
+use crate::route::{DepartureTime, Mode, RouteResult};
 use serde::{Deserialize, Serialize};
+
+/// What kind of place this is, so the UI can default the route-search
+/// departure time sensibly. Purely a UI/default-picking convenience — the
+/// engine only looks at `PlaceSpec::departure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceKind {
+    /// 職場・学校 — defaults the departure time to a weekday commute hour.
+    Commute,
+    /// その他 — defaults the departure time to midday.
+    Other,
+}
+
+impl PlaceKind {
+    /// Default local departure time-of-day for this kind. User-editable
+    /// afterwards; this only picks the starting value.
+    pub fn default_departure(self) -> DepartureTime {
+        match self {
+            PlaceKind::Commute => DepartureTime::new(8, 0),
+            PlaceKind::Other => DepartureTime::new(10, 0),
+        }
+    }
+
+    pub fn label_ja(self) -> &'static str {
+        match self {
+            PlaceKind::Commute => "職場・学校",
+            PlaceKind::Other => "その他",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaceSpec {
@@ -12,6 +42,21 @@ pub struct PlaceSpec {
     pub mode: Mode,
     /// Hard cap: a property is dropped if this place can't be reached within.
     pub max_minutes: u32,
+    #[serde(default = "default_place_kind")]
+    pub kind: PlaceKind,
+    /// Local departure time-of-day used when computing this place's route.
+    /// Defaults from `kind` (see [`PlaceKind::default_departure`]) but is
+    /// user-editable per place. See [`DepartureTime`] for which backend
+    /// actually honours it.
+    #[serde(default = "default_departure")]
+    pub departure: DepartureTime,
+}
+
+fn default_place_kind() -> PlaceKind {
+    PlaceKind::Commute
+}
+fn default_departure() -> DepartureTime {
+    PlaceKind::Commute.default_departure()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

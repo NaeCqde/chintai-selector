@@ -152,6 +152,10 @@ impl MigrationTrait for Migration {
             unique
         );
 
+        // NULLs in `departure_bucket` don't collide with each other under
+        // SQLite's unique-index semantics (standard SQL: NULL != NULL), so
+        // this only truly dedupes when every `route_cached` caller passes a
+        // concrete departure time, which is the case today.
         index!(
             "ux_route_cache_key",
             route_cache::Entity,
@@ -161,6 +165,7 @@ impl MigrationTrait for Migration {
                 route_cache::Column::ToLat,
                 route_cache::Column::ToLng,
                 route_cache::Column::Mode,
+                route_cache::Column::DepartureBucket,
             ],
             unique
         );

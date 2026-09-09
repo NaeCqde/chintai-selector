@@ -253,6 +253,7 @@ async fn route_cache_keys_on_rounded_coords() {
         to_lat: 35.6895,
         to_lng: 139.7004,
         mode: TravelMode::Transit,
+        departure_bucket: Some(480),
     };
 
     assert!(route_cache_get(&db, &key).await.unwrap().is_none());
@@ -305,6 +306,52 @@ async fn route_cache_keys_on_rounded_coords() {
     let hit = route_cache_get(&db, &key).await.unwrap().unwrap();
     assert_eq!(hit.duration_sec, 1000);
     assert_eq!(hit.provider, RouteProviderKind::GoogleApi);
+}
+
+#[tokio::test]
+async fn route_cache_keys_on_departure_bucket_too() {
+    // A commute-hour query and a midday query for the same trip must not
+    // collide — departure time changes the transit schedule.
+    let db = db().await;
+    let base = RouteCacheKey {
+        from_lat: 35.658,
+        from_lng: 139.7016,
+        to_lat: 35.6895,
+        to_lng: 139.7004,
+        mode: TravelMode::Transit,
+        departure_bucket: Some(480), // 8:00
+    };
+    route_cache_put(
+        &db,
+        &base,
+        RouteCacheValue {
+            duration_sec: 900,
+            transit_fastest_sec: None,
+            transit_slowest_sec: None,
+            walk_ascent_m: None,
+            walk_descent_m: None,
+            provider: RouteProviderKind::GoogleScrape,
+            result_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let midday = RouteCacheKey {
+        departure_bucket: Some(600), // 10:00
+        ..base.clone()
+    };
+    assert!(route_cache_get(&db, &midday).await.unwrap().is_none());
+
+    let no_departure = RouteCacheKey {
+        departure_bucket: None,
+        ..base.clone()
+    };
+    assert!(route_cache_get(&db, &no_departure).await.unwrap().is_none());
+
+    // The original bucket still hits.
+    assert!(route_cache_get(&db, &base).await.unwrap().is_some());
+    assert_eq!(count(&db, route_cache::Entity::find()).await.unwrap(), 1);
 }
 
 #[tokio::test]

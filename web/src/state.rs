@@ -1,7 +1,10 @@
 //! Client-side app state: the editable form model plus the last search result.
 //! Persisted to `localStorage` so a reload keeps your places and filters.
 
-use chintai_types::{Filters, Mode, PlaceSpec, RankKey, RankSpec, SearchRequest, SearchResponse};
+use chintai_types::{
+    DepartureTime, Filters, Mode, PlaceKind, PlaceSpec, RankKey, RankSpec, SearchRequest,
+    SearchResponse,
+};
 use gloo_storage::{LocalStorage, Storage};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -17,6 +20,12 @@ pub struct PlaceInput {
     pub lng: Option<f64>,
     pub mode: Mode,
     pub max_minutes: u32,
+    pub kind: PlaceKind,
+    /// Local departure time-of-day for this place's route search. Defaults
+    /// from `kind` when it's picked (see `PlaceRow`'s kind selector) but
+    /// stays independently editable afterwards.
+    pub departure_hour: u8,
+    pub departure_minute: u8,
     /// Transient: last geocode error, not persisted.
     #[serde(skip)]
     pub error: Option<String>,
@@ -24,6 +33,7 @@ pub struct PlaceInput {
 
 impl Default for PlaceInput {
     fn default() -> Self {
+        let d = PlaceKind::Commute.default_departure();
         Self {
             label: "職場".into(),
             query: String::new(),
@@ -31,6 +41,9 @@ impl Default for PlaceInput {
             lng: None,
             mode: Mode::Transit,
             max_minutes: 30,
+            kind: PlaceKind::Commute,
+            departure_hour: d.hour,
+            departure_minute: d.minute,
             error: None,
         }
     }
@@ -109,6 +122,8 @@ impl FormModel {
                     lng: p.lng?,
                     mode: p.mode,
                     max_minutes: p.max_minutes,
+                    kind: p.kind,
+                    departure: DepartureTime::new(p.departure_hour, p.departure_minute),
                 })
             })
             .collect();

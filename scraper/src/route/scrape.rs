@@ -46,7 +46,10 @@ impl GoogleMapsScrape {
         let e = match mode {
             Mode::Car => 0,
             Mode::Walk => 2,
-            Mode::Transit => 3,
+            // Never actually reaches a provider (the engine decomposes it
+            // into two legs first) — Transit is the closest single-mode
+            // fallback if it ever did.
+            Mode::Transit | Mode::PickupTransit => 3,
         };
         let dir_url = format!(
             "https://www.google.com/maps/dir/{},{}/{},{}/data=!4m2!4m1!3e{e}",
@@ -69,7 +72,17 @@ impl GoogleMapsScrape {
 
 #[async_trait::async_trait]
 impl RouteProvider for GoogleMapsScrape {
-    async fn route(&self, from: LatLng, to: LatLng, mode: Mode) -> Result<RouteResult, RouteError> {
+    async fn route(
+        &self,
+        from: LatLng,
+        to: LatLng,
+        mode: Mode,
+        // Tried the documented `!6e/!7e/!8j` and the `!19m2!2e/!3j` field
+        // Google's own server transcodes it to — neither changed the
+        // computed itinerary in live testing, so this scrape path has no
+        // known way to honour a departure time. Always "depart now".
+        _departure: Option<DepartureTime>,
+    ) -> Result<RouteResult, RouteError> {
         let json = self.directions_json(from, to, mode).await?;
         let trips = json
             .pointer("/0/1")
@@ -78,7 +91,7 @@ impl RouteProvider for GoogleMapsScrape {
             .ok_or(RouteError::NoRoute)?;
 
         match mode {
-            Mode::Transit => {
+            Mode::Transit | Mode::PickupTransit => {
                 let mut its: Vec<Itinerary> = trips.iter().filter_map(parse_transit_trip).collect();
                 if its.is_empty() {
                     return Err(RouteError::NoRoute);

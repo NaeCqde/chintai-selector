@@ -35,7 +35,16 @@ use chintai_db::{DatabaseConnection, RouteCacheKey, RouteCacheValue};
 
 #[async_trait::async_trait]
 pub trait RouteProvider: Send + Sync {
-    async fn route(&self, from: LatLng, to: LatLng, mode: Mode) -> Result<RouteResult, RouteError>;
+    /// `departure`: see [`DepartureTime`] doc — only [`GoogleRoutesApi`] can
+    /// currently honour it; every other provider ignores it and computes
+    /// "depart now" regardless.
+    async fn route(
+        &self,
+        from: LatLng,
+        to: LatLng,
+        mode: Mode,
+        departure: Option<DepartureTime>,
+    ) -> Result<RouteResult, RouteError>;
 }
 
 /// The route chain. Per project direction, transit detail comes from Google
@@ -52,6 +61,16 @@ pub fn default_provider(http: HttpClient, google_api_key: Option<String>) -> Fal
     FallbackProvider::new(chain)
 }
 
+/// Buckets a departure time to the nearest 30 minutes, so nearby times (e.g.
+/// two commute places both defaulting to 8:00 but nudged a few minutes apart)
+/// still share a cache row instead of each missing forever.
+fn departure_bucket(d: Option<DepartureTime>) -> Option<i32> {
+    d.map(|d| {
+        let mins = d.hour as i32 * 60 + d.minute as i32;
+        (mins / 30) * 30
+    })
+}
+
 /// Look the trip up in `route_cache`; on a miss compute it with `provider` and
 /// store the result. Coordinates are rounded by the repo layer.
 pub async fn route_cached(
@@ -60,6 +79,7 @@ pub async fn route_cached(
     from: LatLng,
     to: LatLng,
     mode: Mode,
+    departure: Option<DepartureTime>,
 ) -> Result<RouteResult, RouteError> {
     let key = RouteCacheKey {
         from_lat: from.lat,
@@ -67,6 +87,7 @@ pub async fn route_cached(
         to_lat: to.lat,
         to_lng: to.lng,
         mode: mode_to_db(mode),
+        departure_bucket: departure_bucket(departure),
     };
 
     if let Ok(Some(row)) = chintai_db::route_cache_get(db, &key).await {
@@ -77,7 +98,7 @@ pub async fn route_cached(
         }
     }
 
-    let result = provider.route(from, to, mode).await?;
+    let result = provider.route(from, to, mode, departure).await?;
 
     // Instant estimates aren't worth a row (and would evict a real result).
     if result.provider.is_estimate() {
@@ -106,7 +127,10 @@ fn mode_to_db(m: Mode) -> TravelMode {
     match m {
         Mode::Walk => TravelMode::Walk,
         Mode::Car => TravelMode::Car,
-        Mode::Transit => TravelMode::Transit,
+        // `route_cached` is never called with `PickupTransit` itself — the
+        // engine only ever calls it for that mode's second leg, which is
+        // plain `Transit`. Kept here only so the match stays exhaustive.
+        Mode::Transit | Mode::PickupTransit => TravelMode::Transit,
     }
 }
 

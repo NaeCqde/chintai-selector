@@ -1,7 +1,7 @@
 //! The whole UI. PC: left settings/results panel, right map. Mobile: map with a
 //! bottom sheet (CSS only). Buggy-but-complete is fine for now.
 
-use chintai_types::{Leg, Mode, PoiKind, RankKey, RouteResult};
+use chintai_types::{Leg, Mode, PlaceKind, PoiKind, RankKey, RouteResult};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -145,6 +145,7 @@ fn PlaceRow(idx: usize) -> impl IntoView {
                         let m = match event_target_value(&ev).as_str() {
                             "walk" => Mode::Walk,
                             "car" => Mode::Car,
+                            "pickup_transit" => Mode::PickupTransit,
                             _ => Mode::Transit,
                         };
                         set_field(Box::new(move |p| p.mode = m));
@@ -152,12 +153,14 @@ fn PlaceRow(idx: usize) -> impl IntoView {
                     prop:value=move || match get().map(|p| p.mode) {
                         Some(Mode::Walk) => "walk",
                         Some(Mode::Car) => "car",
+                        Some(Mode::PickupTransit) => "pickup_transit",
                         _ => "transit",
                     }
                 >
                     <option value="walk">"完全徒歩"</option>
                     <option value="car">"車"</option>
                     <option value="transit">"公共交通＋徒歩"</option>
+                    <option value="pickup_transit">"送迎(車)＋公共交通"</option>
                 </select>
                 <label class="minutes">
                     <input
@@ -183,6 +186,56 @@ fn PlaceRow(idx: usize) -> impl IntoView {
                         None => ().into_any(),
                     }}
                 </span>
+            </div>
+            <div class="row small">
+                <select
+                    title="行先タイプ"
+                    on:change=move |ev| {
+                        let k = match event_target_value(&ev).as_str() {
+                            "other" => PlaceKind::Other,
+                            _ => PlaceKind::Commute,
+                        };
+                        let d = k.default_departure();
+                        // Selecting a kind overwrites the departure time with
+                        // that kind's default; the time stays independently
+                        // editable afterward (changing kind again re-applies
+                        // its default, undoing a manual edit — expected).
+                        set_field(Box::new(move |p| {
+                            p.kind = k;
+                            p.departure_hour = d.hour;
+                            p.departure_minute = d.minute;
+                        }));
+                    }
+                    prop:value=move || match get().map(|p| p.kind) {
+                        Some(PlaceKind::Other) => "other",
+                        _ => "commute",
+                    }
+                >
+                    <option value="commute">"職場・学校"</option>
+                    <option value="other">"その他"</option>
+                </select>
+                <label class="minutes">
+                    <input
+                        type="time"
+                        prop:value=move || {
+                            get()
+                                .map(|p| format!("{:02}:{:02}", p.departure_hour, p.departure_minute))
+                                .unwrap_or_default()
+                        }
+                        on:input=move |ev| {
+                            let v = event_target_value(&ev);
+                            if let Some((h, m)) = v.split_once(':') {
+                                if let (Ok(h), Ok(m)) = (h.parse::<u8>(), m.parse::<u8>()) {
+                                    set_field(Box::new(move |p| {
+                                        p.departure_hour = h;
+                                        p.departure_minute = m;
+                                    }));
+                                }
+                            }
+                        }
+                    />
+                    "出発"
+                </label>
             </div>
         </div>
     }
@@ -674,6 +727,7 @@ fn mode_color(m: Mode) -> &'static str {
         Mode::Walk => "#2e7d32",
         Mode::Car => "#c62828",
         Mode::Transit => "#1565c0",
+        Mode::PickupTransit => "#7a53c9",
     }
 }
 
