@@ -11,7 +11,7 @@ const MAX_SAMPLES: usize = 16;
 
 #[derive(Clone)]
 pub struct GsiElevation {
-    http: HttpClient,
+    http: Option<HttpClient>,
 }
 
 #[derive(serde::Deserialize)]
@@ -30,7 +30,13 @@ impl GsiElevation {
     pub fn new(http: HttpClient) -> Self {
         // Pace is tuned in `crate::pacing::GSI_ELEVATION`.
         http.set_host_interval("cyberjapandata2.gsi.go.jp", crate::pacing::GSI_ELEVATION);
-        Self { http }
+        Self { http: Some(http) }
+    }
+
+    /// No network — every lookup returns `None`. For the bulk
+    /// property->station precompute, which only needs the walk *duration*.
+    pub fn noop() -> Self {
+        Self { http: None }
     }
 
     /// Total metres climbed / descended along an encoded polyline. `None` if we
@@ -41,6 +47,7 @@ impl GsiElevation {
     }
 
     pub async fn delta_for_path(&self, path: &[LatLng]) -> Option<ElevationDelta> {
+        self.http.as_ref()?;
         let pts = polyline::sample(path, MAX_SAMPLES);
         if pts.len() < 2 {
             return None;
@@ -70,9 +77,9 @@ impl GsiElevation {
     }
 
     async fn elevation_at(&self, p: LatLng) -> Option<f64> {
+        let http = self.http.as_ref()?;
         let (lat, lng) = (p.lat.to_string(), p.lng.to_string());
-        let resp: GsiResp = self
-            .http
+        let resp: GsiResp = http
             .get_json(
                 GSI_URL,
                 &[("lon", &lng), ("lat", &lat), ("outtype", "JSON")],

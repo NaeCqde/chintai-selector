@@ -345,7 +345,9 @@ async fn google_stations_cmd(
         .unwrap_or(2_000u64);
 
     let http = HttpClient::default();
-    let provider = GoogleMapsScrape::new(http.clone(), GsiElevation::new(http));
+    // The batch only needs the walk *duration* to each station — skip the
+    // per-route GSI elevation sampling (16 requests each) entirely.
+    let provider = GoogleMapsScrape::new(http, GsiElevation::noop());
     let run = chintai_db::ingest_run_start(db, "google-stations").await?;
     let (mut ok, mut miss, mut unresolved) = (0u64, 0u64, 0u64);
 
