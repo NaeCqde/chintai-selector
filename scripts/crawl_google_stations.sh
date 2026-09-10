@@ -24,8 +24,8 @@ BATCH="${BATCH:-500}"
 while true; do
     out=$("$BIN" google-stations --limit "$BATCH" 2>&1)
     echo "$out"
-    pending=$(echo "$out" | grep -oE '[0-9]+ properties pending' | grep -oE '^[0-9]+')
-    backfill=$(echo "$out" | grep -oE '[0-9]+ properties need car-time backfill' | grep -oE '^[0-9]+')
+    pending=$(echo "$out" | grep -oE '[0-9]+ (station rows|properties) pending' | grep -oE '^[0-9]+')
+    backfill=$(echo "$out" | grep -oE '[0-9]+ station rows need car-time backfill' | grep -oE '^[0-9]+')
     if [ "${pending:-0}" -eq 0 ] && [ "${backfill:-0}" -eq 0 ]; then
         echo "google-stations: queue empty, done"
         break
