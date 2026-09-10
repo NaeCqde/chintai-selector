@@ -17,7 +17,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-BIN=./target/debug/ingest
+BIN="${BIN:-./target/debug/ingest}"
 export RUST_LOG="${RUST_LOG:-info}"
 BATCH="${BATCH:-500}"
 
