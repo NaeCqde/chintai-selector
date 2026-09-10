@@ -40,6 +40,34 @@ impl RouteProvider for MockProvider {
     }
 }
 
+/// Always reports a fixed duration, whatever the distance — used to make the
+/// real route check disagree with the optimistic estimate.
+struct FixedProvider(Duration);
+
+#[async_trait::async_trait]
+impl RouteProvider for FixedProvider {
+    async fn route(
+        &self,
+        _from: LatLng,
+        _to: LatLng,
+        mode: Mode,
+        _departure: Option<DepartureTime>,
+    ) -> Result<RouteResult, RouteError> {
+        Ok(RouteResult::single(
+            mode,
+            ProviderKind::GoogleScrape,
+            Itinerary {
+                duration: self.0,
+                depart: None,
+                arrive: None,
+                fare_yen: None,
+                transfers: 0,
+                legs: vec![],
+            },
+        ))
+    }
+}
+
 async fn seed() -> DatabaseConnection {
     let db = connect("sqlite::memory:").await.unwrap();
 
@@ -188,7 +216,6 @@ async fn time_limit_drops_the_far_property() {
         filters: Filters::default(),
         ranking: vec![],
         limit: 10,
-        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
 
@@ -218,7 +245,6 @@ async fn rent_filter_and_layout_filter() {
         },
         ranking: vec![],
         limit: 10,
-        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
     // Both properties have a sub-90k 1K unit and are within 60 min transit.
@@ -242,7 +268,6 @@ async fn conveni_walk_filter_drops_property_b() {
         },
         ranking: vec![],
         limit: 10,
-        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
     assert_eq!(resp.matched, 1);
@@ -259,7 +284,6 @@ async fn ranking_by_area_puts_bigger_first() {
         filters: Filters::default(),
         ranking: vec![RankSpec::new(RankKey::Area, 1.0)],
         limit: 10,
-        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
     assert_eq!(resp.results[0].name, "近マンション"); // has the 40 m² unit
@@ -276,7 +300,6 @@ async fn route_detail_is_carried_through() {
         filters: Filters::default(),
         ranking: vec![],
         limit: 5,
-        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
     let pa = &resp.results[0].places[0];
@@ -339,7 +362,6 @@ async fn pickup_transit_combines_precomputed_car_leg_with_live_transit() {
         filters: Filters::default(),
         ranking: vec![],
         limit: 5,
-        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
     let found = resp
@@ -371,6 +393,42 @@ async fn pickup_transit_combines_precomputed_car_leg_with_live_transit() {
     );
 }
 
+/// The optimistic estimate can let a property through that the real route
+/// then puts over the limit. Only the real check decides what is listed.
+#[tokio::test]
+async fn real_route_over_limit_drops_a_property_the_estimate_let_through() {
+    // 近マンション is ~85 m from the place, so the estimate says ~7 min for
+    // any mode — comfortably inside a 60-minute cap.
+    let req = SearchRequest {
+        places: vec![shibuya_place(60, Mode::Transit)],
+        filters: Filters {
+            // keep it to the single nearby property for a clean assertion
+            max_conveni_walk_min: Some(5),
+            ..Default::default()
+        },
+        ranking: vec![],
+        limit: 10,
+    };
+
+    // Real route = 61 min > 60 → nothing clears. (Fresh DB: `route_cached`
+    // persists results, so the two providers need separate caches.)
+    let db = seed().await;
+    let over = FixedProvider(Duration::from_secs(61 * 60));
+    let resp = Engine::new(&db, &over).search(&req).await.unwrap();
+    assert_eq!(resp.matched, 0);
+    assert!(resp.results.is_empty());
+    // it *was* checked (estimate let it through), it just didn't pass
+    assert!(resp.routed >= 1);
+
+    // Real route = 59 min ≤ 60 → it clears.
+    let db = seed().await;
+    let under = FixedProvider(Duration::from_secs(59 * 60));
+    let resp = Engine::new(&db, &under).search(&req).await.unwrap();
+    assert_eq!(resp.matched, 1);
+    assert_eq!(resp.results[0].name, "近マンション");
+    assert!(resp.results[0].places[0].within_limit);
+}
+
 /// A property whose car-to-station leg hasn't been precomputed yet must not
 /// be silently treated as reachable under 送迎モード.
 #[tokio::test]
@@ -384,7 +442,6 @@ async fn pickup_transit_excludes_properties_without_a_precomputed_car_leg() {
         filters: Filters::default(),
         ranking: vec![],
         limit: 5,
-        refine: false,
     };
     let resp = engine.search(&req).await.unwrap();
     assert!(

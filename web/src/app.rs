@@ -448,14 +448,14 @@ fn SearchBar() -> impl IntoView {
             <button class="primary" on:click=run disabled=move || state.loading.get()>
                 {move || if state.loading.get() { "検索中… (初回は経路取得で数十秒)" } else { "物件を検索" }}
             </button>
-            <p class="muted tiny">"上位10件は Google マップの経路（乗換案内・最寄り駅までの徒歩）を取得します。初回は時間がかかります。"</p>
+            <p class="muted tiny">"掲載されるのは、登録した全地点の所要時間を Google マップの経路で確認して条件を満たした物件だけです。初回は経路取得に時間がかかります。"</p>
             {move || state.error.get().map(|e| view! { <p class="err">{e}</p> })}
             {move || state.results.get().map(|r| view! {
                 <p class="muted">
                     {format!(
-                        "{} 件が条件突破 / {} 件を評価{}",
-                        r.matched, r.routed.max(r.considered),
-                        if r.capped { "（近い順に上限あり）" } else { "" }
+                        "{} 件が全地点の条件を突破（{} 件を経路で確認 / 候補 {} 件）{}",
+                        r.matched, r.routed, r.considered,
+                        if r.capped { "・近い順に上限あり" } else { "" }
                     )}
                 </p>
             })}

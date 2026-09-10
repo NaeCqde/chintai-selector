@@ -125,11 +125,6 @@ pub struct SearchRequest {
     pub ranking: Vec<RankSpec>,
     #[serde(default = "default_limit")]
     pub limit: u32,
-    /// Fetch accurate routes + transfer guidance for the top results (needs a
-    /// network round-trip each; the first uncached search takes ~10-20s).
-    /// `false` = fast estimate only.
-    #[serde(default)]
-    pub refine: bool,
 }
 
 fn default_limit() -> u32 {
@@ -146,14 +141,17 @@ pub struct SearchResponse {
     /// Of those, how many were close enough (crow-flies) to be worth routing.
     #[serde(default)]
     pub plausible: usize,
-    /// How many were actually routed (capped for latency).
+    /// How many candidates got a real Google Maps route check (walking the
+    /// ranked list until `limit` properties are confirmed, or the pool runs
+    /// out).
     #[serde(default)]
     pub routed: usize,
     /// True when `plausible` exceeded the routing cap, so some candidates
     /// further out were not evaluated.
     #[serde(default)]
     pub capped: bool,
-    /// How many survived every place's time limit.
+    /// How many were confirmed within every place's time limit by a real
+    /// route — i.e. how many are actually listed.
     pub matched: usize,
 }
 

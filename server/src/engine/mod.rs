@@ -32,6 +32,13 @@ use geo::{haversine_m, walk_minutes};
 /// (crow-flies) are kept.
 const ROUTE_CAP: usize = 60;
 
+/// How far over a place's limit the *estimate* may be for a candidate to still
+/// get a real route check. The estimate is rough (crow-flies × a fixed detour
+/// factor), so hard-dropping anything the estimate puts even slightly over
+/// would hide properties a real route would clear. The real check in step 3b
+/// is the source of truth for what actually gets listed.
+const ESTIMATE_SLACK: f64 = 1.35;
+
 /// Optimistic door-to-door speed as metres per minute — a candidate further
 /// than `minutes * this` from a place cannot possibly reach it in time, so it
 /// is dropped before routing.
@@ -111,16 +118,12 @@ fn straight_line_sum(c: &Candidate, places: &[PlaceSpec]) -> f64 {
 
 pub struct Engine<'a> {
     pub db: &'a DatabaseConnection,
-    /// The accurate provider (Google scrape → API). Used to refine the top
-    /// results after the fast estimate pass ranks everything.
+    /// The accurate provider (Google Maps scrape). After the fast estimate
+    /// pass ranks everything, this confirms the real travel time for every
+    /// place of the top candidates — a property is only listed once every
+    /// place is verified within its limit.
     pub provider: &'a dyn RouteProvider,
 }
-
-/// Top-N results that get real Google Maps routes (accurate times + transit
-/// transfer detail + walk-to-station) after the estimate pass ranks
-/// everything. The first uncached search of this many takes ~20-40s; results
-/// are then in `route_cache`.
-const REFINE_CAP: usize = 10;
 
 impl<'a> Engine<'a> {
     pub fn new(db: &'a DatabaseConnection, provider: &'a dyn RouteProvider) -> Self {
@@ -261,7 +264,11 @@ impl<'a> Engine<'a> {
                     };
                     let minutes = (route.duration.as_secs() as f64 / 60.0).ceil() as u32;
                     let within = minutes <= place.max_minutes;
-                    all_ok &= within;
+                    // Lenient gate: keep anything the rough estimate puts
+                    // within `ESTIMATE_SLACK` of the cap so step 3b can settle
+                    // it with a real route. `within_limit` still records the
+                    // strict estimate result.
+                    all_ok &= minutes as f64 <= place.max_minutes as f64 * ESTIMATE_SLACK;
                     places.push(PlaceAccess {
                         label: place.label.clone(),
                         minutes,
@@ -276,9 +283,6 @@ impl<'a> Engine<'a> {
         .filter_map(|x| async move { x })
         .collect()
         .await;
-
-        let routed_count = plausible.min(ROUTE_CAP);
-        let matched = routed.len();
 
         // --- 3. score + sort ------------------------------------------------
         let metrics: Vec<Metrics> = routed.iter().map(Metrics::of).collect();
@@ -296,16 +300,25 @@ impl<'a> Engine<'a> {
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(req.limit as usize);
 
-        // --- 3b. refine the shown results with real Google Maps routes ----
-        // Accurate times + transit transfer detail for every place. Bounded
-        // so the first (uncached) search stays interactive; the rest keep
-        // their estimate. (The listing's own station time is not computed
-        // here — it's precomputed by `ingest google-stations` and read
-        // straight off the property row in `to_ranked`.)
-        for (_, rc, _) in scored.iter_mut().take(REFINE_CAP) {
+        // --- 3b. verify with real Google Maps routes -----------------------
+        // The estimate pass is optimistic (crow-flies × a detour factor), so
+        // a candidate it let through can still be over the real limit —
+        // especially for transit. Walk the ranked list, replace every place's
+        // estimate with a real routed time + transfer detail, and keep the
+        // property ONLY if every place is confirmed within its cap. An
+        // unverified place (route fetch failed) is treated as not cleared.
+        // Stop once `limit` properties are confirmed, or the pool runs out.
+        let want = req.limit.max(1) as usize;
+        let mut kept: Vec<(f64, RoutedCandidate)> = Vec::with_capacity(want);
+        let mut verified = 0usize;
+        for (score, mut rc, _) in scored {
+            if kept.len() >= want {
+                break;
+            }
+            verified += 1;
             let origin = LatLng::new(rc.c.prop.lat.unwrap(), rc.c.prop.lng.unwrap());
+            let mut all_cleared = true;
             for (pa, place) in rc.places.iter_mut().zip(&req.places) {
                 let dest = LatLng::new(place.lat, place.lng);
 
@@ -340,17 +353,33 @@ impl<'a> Engine<'a> {
                     .await
                 };
 
-                if let Ok(real) = real {
-                    pa.minutes = (real.duration.as_secs() as f64 / 60.0).ceil() as u32;
-                    pa.within_limit = pa.minutes <= place.max_minutes;
-                    pa.route = real;
+                match real {
+                    Ok(real) => {
+                        let minutes = (real.duration.as_secs() as f64 / 60.0).ceil() as u32;
+                        pa.minutes = minutes;
+                        pa.within_limit = minutes <= place.max_minutes;
+                        pa.route = real;
+                        all_cleared &= pa.within_limit;
+                    }
+                    // Couldn't get a real route — don't guess. An unverified
+                    // place is not a cleared place, so this property is out.
+                    Err(e) => {
+                        log::debug!("verify route failed for place {:?}: {e}", place.label);
+                        pa.within_limit = false;
+                        all_cleared = false;
+                    }
                 }
+            }
+            if all_cleared {
+                kept.push((score, rc));
             }
         }
 
+        let matched = kept.len();
+
         // --- 4. materialise ------------------------------------------------
-        let mut results = Vec::with_capacity(scored.len());
-        for (i, (score, rc, _)) in scored.into_iter().enumerate() {
+        let mut results = Vec::with_capacity(kept.len());
+        for (i, (score, rc)) in kept.into_iter().enumerate() {
             results.push(self.to_ranked(i as u32 + 1, score, rc).await?);
         }
 
@@ -358,7 +387,7 @@ impl<'a> Engine<'a> {
             results,
             considered,
             plausible,
-            routed: routed_count,
+            routed: verified,
             capped,
             matched,
         })
