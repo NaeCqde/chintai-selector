@@ -65,11 +65,16 @@ impl GoogleMapsScrape {
 
         let rel = extract_preview_url(&html)
             .ok_or_else(|| RouteError::Parse("no preview/directions link in dir HTML".into()))?;
-        let rel = match departure {
-            Some(d) => patch_departure_time(&rel, e, d)
-                .ok_or_else(|| RouteError::Parse("couldn't patch departure time into pb".into()))?,
-            None => rel,
-        };
+
+        // Departure-time patching is currently DISABLED for the scrape path:
+        // inserting the `!19m3!1e0!2e2!3j{ts}` block makes Google return a
+        // stripped-down response where a multi-modal transit trip collapses
+        // into pseudo-"walk" steps with no line/station/time detail (verified
+        // against real 蒲田→有明 routes). A "depart now" query returns the
+        // full itinerary, and transit times don't swing much outside rush
+        // hour — a better trade than a broken breakdown. `DepartureTime` is
+        // still honoured by the Routes API path when a key is set.
+        let _ = departure;
         let url = format!("https://www.google.com/{rel}");
 
         let body = self.http.get_text(&url, &[]).await?;
@@ -79,19 +84,15 @@ impl GoogleMapsScrape {
 }
 
 /// Patches a departure time into the auto-generated preview-directions `pb`
-/// (which defaults to "depart now" and has no time fields at all). Found by
-/// diffing a real "depart at 8:00" URL a user captured from their own
-/// browser against our own default-generated one for the same trip: the
+/// (which defaults to "depart now" and has no time fields at all): the
 /// `!20m5!1e{mode}!2e3!5e2!6b1!14b1` block shrinks to `!20m3!5e2!6b1!14b1`
 /// and a new `!19m3!1e0!2e2!3j{ts}` block is inserted right before it.
 ///
-/// `{ts}` is *not* a real Unix timestamp for the intended instant: verified
-/// empirically (two otherwise-identical requests, one with the correct UTC
-/// timestamp for "8:00 JST" and one treating "8:00" as if it were already
-/// UTC) that Google reads the JST wall-clock date/time as literal UTC
-/// numerals with no offset applied. So this builds the timestamp the same
-/// way: take the next JST occurrence of `d`'s clock time, then treat those
-/// same calendar numbers as UTC when computing epoch seconds.
+/// DISABLED at the call site — this transform makes Google return a
+/// stripped-down response that drops all transit line/station/time detail.
+/// Kept (with its tests) as a starting point if the real transform is worked
+/// out later. See `directions_json`.
+#[allow(dead_code)]
 fn patch_departure_time(rel: &str, mode_code: u8, d: DepartureTime) -> Option<String> {
     let from = format!("%2120m5%211e{mode_code}%212e3%215e2%216b1%2114b1");
     if !rel.contains(&from) {
@@ -104,6 +105,7 @@ fn patch_departure_time(rel: &str, mode_code: u8, d: DepartureTime) -> Option<St
 
 /// See [`patch_departure_time`]'s doc for why this deliberately does *not*
 /// convert JST to a true UTC instant.
+#[allow(dead_code)]
 fn google_naive_departure_timestamp(d: DepartureTime) -> i64 {
     let jst = FixedOffset::east_opt(9 * 3600).expect("valid fixed offset");
     let now_jst = Utc::now().with_timezone(&jst);
@@ -228,8 +230,17 @@ fn parse_transit_trip(trip: &Value) -> Option<Itinerary> {
             .unwrap_or("0 分");
         let dur = Duration::from_secs(jp_minutes(dur_txt) * 60);
 
-        let is_transit = step.as_array().map(|a| a.len()).unwrap_or(0) >= 6
-            && step.pointer("/0/5/0/2").is_some();
+        // A transit step carries a times block at `[0][5]` and a transit-line
+        // block at `[0][6]`; a walk step has `[0][5] == null` and `[0][6] == []`.
+        let has_times = step
+            .pointer("/0/5")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty());
+        let has_line = step
+            .pointer("/0/6")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty());
+        let is_transit = has_times || has_line;
 
         if !is_transit {
             legs.push(Leg::Walk(WalkLeg {
@@ -292,6 +303,13 @@ fn parse_transit_trip(trip: &Value) -> Option<Itinerary> {
             num_stops,
             color: None,
         }));
+    }
+
+    // No transit leg parsed = a degraded / non-transit response for this
+    // trip. Drop it rather than show a bogus all-walk breakdown; the engine
+    // then keeps its estimate for the leg.
+    if transit_count == 0 {
+        return None;
     }
 
     Some(Itinerary {
@@ -463,6 +481,33 @@ mod tests {
         assert!(t.iter().any(|x| x.from_station.ends_with('駅')));
         assert!(t.iter().any(|x| x.operator.is_some()));
         assert!(t.iter().any(|x| x.depart.is_some()));
+    }
+
+    /// 蒲田 → 有明（バス + りんかい線 等）: every leg must be classified
+    /// correctly — no train segment rendered as a 6 km/h "walk".
+    #[test]
+    fn transit_fixture_ariake_bus_and_rail() {
+        let json = load("gmaps_transit_ariake.json");
+        let trips = json.pointer("/0/1").unwrap().as_array().unwrap();
+        let its: Vec<_> = trips.iter().filter_map(parse_transit_trip).collect();
+        assert!(!its.is_empty());
+
+        for it in &its {
+            for leg in &it.legs {
+                if let Leg::Walk(w) = leg {
+                    if let (Some(m), s) = (w.distance_m, w.duration.as_secs()) {
+                        if s > 0 {
+                            let kmh = m / s as f64 * 3.6;
+                            assert!(kmh < 9.0, "walk leg at {kmh:.0} km/h ({m} m / {s} s)");
+                        }
+                    }
+                }
+            }
+            assert!(
+                it.legs.iter().any(|l| matches!(l, Leg::Transit(_))),
+                "an itinerary with no transit leg leaked through"
+            );
+        }
     }
 
     #[test]
