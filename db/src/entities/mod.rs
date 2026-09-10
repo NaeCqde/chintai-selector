@@ -7,6 +7,7 @@ pub mod delivery;
 pub mod ingest_run;
 pub mod listing;
 pub mod property;
+pub mod property_station;
 pub mod railway_line;
 pub mod route_cache;
 pub mod station;

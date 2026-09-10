@@ -390,12 +390,26 @@ mod tests {
 
     #[test]
     fn patch_departure_time_matches_the_real_captured_transformation() {
-        // The exact timestamp a user captured from their own browser for a
-        // real "depart at 8:00 JST" Yano->Hiroshima transit search — fetched
-        // directly and confirmed the response's departure clocks read ~8:00.
+        // Shape of the transformation a user captured for a real "depart at
+        // 8:00 JST" transit search. The `3j<epoch>` is the next 8:00 JST from
+        // *now*, so assert the structure, not a frozen timestamp.
         let d = DepartureTime::new(8, 0);
         let patched = patch_departure_time(BASELINE_TAIL, 3, d).expect("pattern must match");
-        assert!(patched.contains("%2119m3%211e0%212e2%213j1789027200%2120m3%215e2%216b1%2114b1"));
+
+        let marker = "%2119m3%211e0%212e2%213j";
+        let at = patched.find(marker).expect("19m3 block inserted");
+        let after = &patched[at + marker.len()..];
+        let epoch: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        assert!(epoch.len() >= 10, "epoch digits present, got {epoch:?}");
+        let secs: i64 = epoch.parse().unwrap();
+        // Within the next 8 days and in the future (next weekday 08:00 JST).
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            secs > now && secs < now + 8 * 86_400,
+            "epoch {secs} vs now {now}"
+        );
+        assert!(after.starts_with(&format!("{epoch}%2120m3%215e2%216b1%2114b1")));
+
         // Everything outside the patched block is untouched.
         assert!(patched.starts_with("%2117m1%213e1%21"));
         assert!(patched.ends_with("%2146m1%211b0"));

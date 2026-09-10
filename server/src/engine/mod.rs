@@ -48,34 +48,33 @@ fn reachable_ceiling_m(mode: chintai_scraper::route::Mode, minutes: u32) -> f64 
     minutes as f64 * per_min + 400.0 // + slack for the last-leg walk
 }
 
-/// The listing's own station, already resolved by `ingest google-stations`
-/// (real Google Maps walk time). `station_walk_min == -1` is the "tried and
-/// failed to resolve" sentinel, distinct from "not attempted yet".
-fn nearest_station_of(prop: &entities::property::Model) -> Option<NearestStation> {
-    let name = prop.station_name.clone().filter(|n| !n.is_empty())?;
-    let walk_minutes = prop.station_walk_min?;
+/// The listing's best resolved station (`property_station` row with the
+/// smallest non-negative `walk_min`, from `ingest google-stations`).
+fn nearest_station_of(ps: Option<&entities::property_station::Model>) -> Option<NearestStation> {
+    let ps = ps?;
+    let walk_minutes = ps.walk_min?;
     if walk_minutes < 0 {
         return None;
     }
     Some(NearestStation {
-        name,
+        name: ps.station_name.clone(),
         walk_minutes: walk_minutes as u32,
-        distance_m: prop.station_distance_m.unwrap_or_default(),
+        distance_m: ps.distance_m.unwrap_or_default(),
     })
 }
 
-/// 送迎モード's fixed first leg: someone drives the property's own precomputed
+/// 送迎モード's fixed first leg: someone drives the property's precomputed
 /// station car-time (`ingest google-stations`), never a live route call.
-/// `None` until that batch has resolved *both* the walk and car legs for this
-/// property (see `set_property_station_time`'s doc), or if the car leg
-/// specifically failed (`car_min == -1` or `None`).
-fn station_car_leg(prop: &entities::property::Model) -> Option<(u32, LatLng)> {
-    let car_min = prop.station_car_min?;
+/// `None` until that batch resolved *both* legs for this property, or if the
+/// car leg specifically failed (`car_min == -1` or `None`).
+fn station_car_leg(ps: Option<&entities::property_station::Model>) -> Option<(u32, LatLng)> {
+    let ps = ps?;
+    let car_min = ps.car_min?;
     if car_min < 0 {
         return None;
     }
-    let lat = prop.station_lat?;
-    let lng = prop.station_lng?;
+    let lat = ps.station_lat?;
+    let lng = ps.station_lng?;
     Some((car_min as u32, LatLng::new(lat, lng)))
 }
 
@@ -192,6 +191,7 @@ impl<'a> Engine<'a> {
                 prop,
                 units: matching,
                 near,
+                station: None,
             });
         }
         let considered = candidates.len();
@@ -217,6 +217,13 @@ impl<'a> Engine<'a> {
         candidates.truncate(ROUTE_CAP);
         let capped = plausible > candidates.len();
 
+        // Attach each survivor's best precomputed station (walk + car time).
+        let ids: Vec<i32> = candidates.iter().map(|c| c.prop.id).collect();
+        let mut station_map = chintai_db::resolved_stations_for(self.db, &ids).await?;
+        for c in &mut candidates {
+            c.station = station_map.remove(&c.prop.id);
+        }
+
         // --- 2. estimate-route every candidate (instant, no network) -------
         let estimator = EstimateProvider;
         let routed: Vec<RoutedCandidate> = stream::iter(candidates.into_iter().map(|c| {
@@ -228,7 +235,7 @@ impl<'a> Engine<'a> {
                 for place in &req.places {
                     let dest = LatLng::new(place.lat, place.lng);
                     let route = if place.mode == Mode::PickupTransit {
-                        match station_car_leg(&c.prop) {
+                        match station_car_leg(c.station.as_ref()) {
                             Some((car_min, station)) => {
                                 let leg2 = estimator
                                     .route(
@@ -308,7 +315,7 @@ impl<'a> Engine<'a> {
                     // transit) is refined live like any other place, just
                     // from the station instead of the property, departing
                     // after the drive.
-                    match station_car_leg(&rc.c.prop) {
+                    match station_car_leg(rc.c.station.as_ref()) {
                         Some((car_min, station)) => route_cached(
                             self.db,
                             self.provider,
@@ -364,7 +371,7 @@ impl<'a> Engine<'a> {
         rc: RoutedCandidate,
     ) -> anyhow::Result<RankedProperty> {
         let RoutedCandidate { c, places } = rc;
-        let nearest_station = nearest_station_of(&c.prop);
+        let nearest_station = nearest_station_of(c.station.as_ref());
         let mut units = c.units;
         units.sort_by_key(|u| u.rent_yen.unwrap_or(i32::MAX));
 
@@ -410,6 +417,9 @@ struct Candidate {
     prop: entities::property::Model,
     units: Vec<entities::unit::Model>,
     near: NearbyPois,
+    /// Best resolved `property_station` row (filled after the pre-filter, for
+    /// the candidates that survive it).
+    station: Option<entities::property_station::Model>,
 }
 
 struct RoutedCandidate {

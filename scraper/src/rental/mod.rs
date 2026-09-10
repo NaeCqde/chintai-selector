@@ -123,14 +123,20 @@ pub async fn ingest_area(
                     building_type: b.structure.clone(),
                     built_year: b.built_year,
                     structure: b.structure.clone(),
-                    // The station name exactly as the listing wrote it (not a
-                    // coordinate-nearest guess) — `ingest google-stations`
-                    // walks a real Google Maps route to it for the true time.
-                    station_name: b.stations.first().map(|s| s.station.clone()),
                 },
             )
             .await?;
             counts.buildings += 1;
+
+            // Every station the listing names, in its own order — the real
+            // Google Maps walk/car time to each is filled in later by
+            // `ingest google-stations`.
+            for (rank, st) in b.stations.iter().enumerate() {
+                if !st.station.is_empty() {
+                    chintai_db::upsert_property_station(db, prop.id, &st.station, rank as i32)
+                        .await?;
+                }
+            }
 
             // Approximate coordinates from the nearest scraped station, offset
             // by the scraped walk time in a stable pseudo-random direction (we

@@ -318,9 +318,12 @@ async fn pickup_transit_combines_precomputed_car_leg_with_live_transit() {
     // Precomputed: a 3-minute drive to a station 1km away (well outside
     // MockProvider's car speed, so if this leg were computed live instead of
     // read from the DB, the duration assertion below would fail).
+    let ps = chintai_db::upsert_property_station(&db, a.id, "近駅", 0)
+        .await
+        .unwrap();
     chintai_db::set_property_station_time(
         &db,
-        a.id,
+        ps.id,
         /*walk_min*/ 12,
         /*distance_m*/ Some(900.0),
         /*car_min*/ Some(3),

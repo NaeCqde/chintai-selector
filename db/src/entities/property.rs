@@ -1,6 +1,9 @@
 //! `property` — a building, after de-duplication across listing sites. The
 //! `(name, address)` pair is unique; the scraper resolves fuzzy matches to one
 //! canonical building before upserting.
+//!
+//! The listing's station names (and their real Google Maps walk/car times)
+//! live in `property_station`, not here — a listing can name more than one.
 
 use sea_orm::entity::prelude::*;
 
@@ -18,24 +21,6 @@ pub struct Model {
     pub built_year: Option<i32>,
     /// RC / SRC / 木造 …
     pub structure: Option<String>,
-    /// The station name as written in the rental listing (e.g. "三軒茶屋"),
-    /// not a coordinate-nearest guess. Set once at ingest; never overwritten.
-    pub station_name: Option<String>,
-    /// Real walking time from a Google Maps route, filled in by
-    /// `ingest google-stations`. `None` until that batch reaches this row.
-    /// `-1` = attempted but the station name didn't resolve in our DB.
-    pub station_walk_min: Option<i32>,
-    pub station_distance_m: Option<f64>,
-    /// Real driving time from a Google Maps route, filled in by the same
-    /// `ingest google-stations` pass. Used for 送迎モード (`Mode::PickupTransit`
-    /// — someone drives you to the station, then transit from there): this
-    /// is that first leg, never computed live. Same `-1` sentinel.
-    pub station_car_min: Option<i32>,
-    /// The resolved station's own coordinates, cached here so the engine can
-    /// build 送迎モード's second leg (station -> place, live transit) without
-    /// a `station` table lookup at search time.
-    pub station_lat: Option<f64>,
-    pub station_lng: Option<f64>,
     pub updated_at: DateTimeUtc,
 }
 
@@ -43,11 +28,19 @@ pub struct Model {
 pub enum Relation {
     #[sea_orm(has_many = "super::unit::Entity")]
     Unit,
+    #[sea_orm(has_many = "super::property_station::Entity")]
+    PropertyStation,
 }
 
 impl Related<super::unit::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Unit.def()
+    }
+}
+
+impl Related<super::property_station::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::PropertyStation.def()
     }
 }
 

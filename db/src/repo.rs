@@ -10,16 +10,17 @@
 
 use chrono::Utc;
 use sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select,
+    sea_query::OnConflict, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
+    DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    Select,
 };
 
 use crate::entities::enums::{
     BrandKind, ListingSite, PriceTier, RouteProviderKind, StoreSource, TravelMode,
 };
 use crate::entities::{
-    brand, delivery, ingest_run, listing, property, railway_line, route_cache, station,
-    station_line, store, unit,
+    brand, delivery, ingest_run, listing, property, property_station, railway_line, route_cache,
+    station, station_line, store, unit,
 };
 
 pub use sea_orm::prelude::DateTimeUtc;
@@ -197,8 +198,6 @@ pub struct NewProperty {
     pub building_type: Option<String>,
     pub built_year: Option<i32>,
     pub structure: Option<String>,
-    /// Station name as written in the listing (e.g. "三軒茶屋"). Set once.
-    pub station_name: Option<String>,
 }
 
 pub async fn upsert_property(
@@ -215,19 +214,16 @@ pub async fn upsert_property(
         building_type: Set(p.building_type),
         built_year: Set(p.built_year),
         structure: Set(p.structure),
-        station_name: Set(p.station_name),
         updated_at: Set(now()),
         ..Default::default()
     })
     .on_conflict(
         OnConflict::columns([property::Column::Name, property::Column::Address])
-            // `lat`/`lng`/`station_name` are filled once (by the coordinate
-            // heuristic / geocoder / this insert) and deliberately excluded
-            // here: a rental re-crawl always passes `lat: None` on this path,
-            // and including them would null out coordinates set afterward by
-            // `set_property_coords`. `station_walk_min`/`station_distance_m`/
-            // `station_car_min`/`station_lat`/`station_lng` are never touched
-            // by this function at all (see `set_property_station_time`).
+            // `lat`/`lng` are filled once (by the coordinate heuristic /
+            // geocoder / this insert) and deliberately excluded here: a rental
+            // re-crawl always passes `lat: None` on this path, and including
+            // them would null out coordinates set afterward by
+            // `set_property_coords`. Station data lives in `property_station`.
             .update_columns([
                 property::Column::BuildingType,
                 property::Column::BuiltYear,
@@ -385,56 +381,108 @@ pub async fn set_property_coords(
     Ok(())
 }
 
-/// Properties that have a listing station name but no Google-walked time yet —
-/// the queue for `ingest google-stations`. Needs coordinates too, obviously.
-pub async fn properties_needing_station_time(
+// --------------------------------------------------------------------------
+// property_station — the listing's station name(s) + their real Google Maps
+// walk / car times. One property can name several stations.
+// --------------------------------------------------------------------------
+
+/// Record a station named by a listing (rank = its position in the listing's
+/// own station list). Idempotent on `(property_id, station_name)`; never
+/// overwrites a resolved walk/car time.
+pub async fn upsert_property_station(
     db: &DatabaseConnection,
-    limit: u64,
-) -> Result<Vec<property::Model>, DbErr> {
-    property::Entity::find()
-        .filter(property::Column::StationName.is_not_null())
-        .filter(property::Column::StationName.ne(""))
-        .filter(property::Column::StationWalkMin.is_null())
-        .filter(property::Column::Lat.is_not_null())
-        .order_by_asc(property::Column::Id)
-        .limit(limit)
-        .all(db)
-        .await
+    property_id: i32,
+    station_name: &str,
+    rank: i32,
+) -> Result<property_station::Model, DbErr> {
+    property_station::Entity::insert(property_station::ActiveModel {
+        property_id: Set(property_id),
+        station_name: Set(station_name.to_owned()),
+        rank: Set(rank),
+        updated_at: Set(now()),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::columns([
+            property_station::Column::PropertyId,
+            property_station::Column::StationName,
+        ])
+        .update_columns([
+            property_station::Column::Rank,
+            property_station::Column::UpdatedAt,
+        ])
+        .to_owned(),
+    )
+    .exec_without_returning(db)
+    .await?;
+
+    property_station::Entity::find()
+        .filter(property_station::Column::PropertyId.eq(property_id))
+        .filter(property_station::Column::StationName.eq(station_name))
+        .one(db)
+        .await?
+        .ok_or_else(|| missing("property_station"))
 }
 
-/// Properties whose walk leg resolved *before* car-time / station-coordinate
-/// support existed (so `station_walk_min` is a real, non-negative value but
-/// `station_car_min` is still untouched) — the catch-up queue so an
-/// already-running crawl doesn't leave a permanent backlog when this feature
-/// lands mid-crawl.
-pub async fn properties_needing_station_car_backfill(
+/// `property_station` rows with no Google-walked time yet, paired with their
+/// (coordinate-bearing) property — the queue for `ingest google-stations`.
+pub async fn property_stations_needing_time(
     db: &DatabaseConnection,
     limit: u64,
-) -> Result<Vec<property::Model>, DbErr> {
-    property::Entity::find()
-        .filter(property::Column::StationName.is_not_null())
-        .filter(property::Column::StationName.ne(""))
-        .filter(property::Column::StationWalkMin.gte(0))
-        .filter(property::Column::StationCarMin.is_null())
-        .filter(property::Column::Lat.is_not_null())
-        .order_by_asc(property::Column::Id)
-        .limit(limit)
+) -> Result<Vec<(property_station::Model, property::Model)>, DbErr> {
+    let rows = property_station::Entity::find()
+        .filter(property_station::Column::WalkMin.is_null())
+        .order_by_asc(property_station::Column::PropertyId)
+        .limit(limit * 2)
+        .find_also_related(property::Entity)
         .all(db)
-        .await
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(ps, p)| {
+            let p = p?;
+            (p.lat.is_some() && p.lng.is_some()).then_some((ps, p))
+        })
+        .take(limit as usize)
+        .collect())
 }
 
-/// Fills in just the car leg (+ station coordinates) for a property whose
-/// walk leg is already resolved — see `properties_needing_station_car_backfill`.
+/// `property_station` rows whose walk leg resolved before car-time support
+/// existed (`walk_min >= 0` but `car_min` still NULL) — the catch-up queue.
+pub async fn property_stations_needing_car_backfill(
+    db: &DatabaseConnection,
+    limit: u64,
+) -> Result<Vec<(property_station::Model, property::Model)>, DbErr> {
+    let rows = property_station::Entity::find()
+        .filter(property_station::Column::WalkMin.gte(0))
+        .filter(property_station::Column::CarMin.is_null())
+        .order_by_asc(property_station::Column::PropertyId)
+        .limit(limit * 2)
+        .find_also_related(property::Entity)
+        .all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(ps, p)| {
+            let p = p?;
+            (p.lat.is_some() && p.lng.is_some()).then_some((ps, p))
+        })
+        .take(limit as usize)
+        .collect())
+}
+
+/// Fills in just the car leg (+ resolved station coordinates) for a
+/// `property_station` row whose walk leg is already done.
 pub async fn set_property_station_car(
     db: &DatabaseConnection,
-    id: i32,
+    ps_id: i32,
     car_min: Option<i32>,
     station_lat: f64,
     station_lng: f64,
 ) -> Result<(), DbErr> {
-    property::Entity::update(property::ActiveModel {
-        id: Set(id),
-        station_car_min: Set(car_min),
+    property_station::Entity::update(property_station::ActiveModel {
+        id: Set(ps_id),
+        car_min: Set(car_min),
         station_lat: Set(Some(station_lat)),
         station_lng: Set(Some(station_lng)),
         updated_at: Set(now()),
@@ -445,23 +493,23 @@ pub async fn set_property_station_car(
     Ok(())
 }
 
-/// `car_min`: `None` if the car leg wasn't attempted (e.g. an older run, or a
-/// transient failure — distinct from `Some(-1)`, "attempted and failed").
+/// `car_min`: `None` if the car leg wasn't attempted (older run / transient
+/// failure — distinct from `Some(-1)`, "attempted and failed").
 #[allow(clippy::too_many_arguments)]
 pub async fn set_property_station_time(
     db: &DatabaseConnection,
-    id: i32,
+    ps_id: i32,
     walk_min: i32,
     distance_m: Option<f64>,
     car_min: Option<i32>,
     station_lat: f64,
     station_lng: f64,
 ) -> Result<(), DbErr> {
-    property::Entity::update(property::ActiveModel {
-        id: Set(id),
-        station_walk_min: Set(Some(walk_min)),
-        station_distance_m: Set(distance_m),
-        station_car_min: Set(car_min),
+    property_station::Entity::update(property_station::ActiveModel {
+        id: Set(ps_id),
+        walk_min: Set(Some(walk_min)),
+        distance_m: Set(distance_m),
+        car_min: Set(car_min),
         station_lat: Set(Some(station_lat)),
         station_lng: Set(Some(station_lng)),
         updated_at: Set(now()),
@@ -472,19 +520,63 @@ pub async fn set_property_station_time(
     Ok(())
 }
 
-/// Properties with no `station_name` yet, oldest first. One-time backfill
-/// target for rows upserted before that column existed — new rows get it
-/// straight from `rental::ingest_area`.
-pub async fn properties_without_station_name(
+/// Marks a `property_station` lookup as attempted-but-failed (`-1` sentinel)
+/// so it isn't retried every batch. The engine treats a negative `walk_min`
+/// as "no station data".
+pub async fn mark_property_station_unresolved(
+    db: &DatabaseConnection,
+    ps_id: i32,
+) -> Result<(), DbErr> {
+    property_station::Entity::update(property_station::ActiveModel {
+        id: Set(ps_id),
+        walk_min: Set(Some(-1)),
+        car_min: Set(Some(-1)),
+        updated_at: Set(now()),
+        ..Default::default()
+    })
+    .exec(db)
+    .await?;
+    Ok(())
+}
+
+/// Property ids that have coordinates but no `property_station` row at all —
+/// one-time backfill target for rows crawled before this table existed.
+pub async fn properties_without_station_rows(
     db: &DatabaseConnection,
     limit: u64,
 ) -> Result<Vec<property::Model>, DbErr> {
-    property::Entity::find()
-        .filter(property::Column::StationName.is_null())
-        .order_by_asc(property::Column::Id)
-        .limit(limit)
+    let stmt = sea_orm::Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "SELECT p.* FROM property p \
+             LEFT JOIN property_station ps ON ps.property_id = p.id \
+             WHERE ps.id IS NULL AND p.lat IS NOT NULL \
+             ORDER BY p.id LIMIT {limit}"
+        ),
+    );
+    property::Model::find_by_statement(stmt).all(db).await
+}
+
+/// Best resolved station per property (min positive `walk_min`), for the given
+/// property ids — what the engine attaches to each candidate.
+pub async fn resolved_stations_for(
+    db: &DatabaseConnection,
+    property_ids: &[i32],
+) -> Result<std::collections::HashMap<i32, property_station::Model>, DbErr> {
+    if property_ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let rows = property_station::Entity::find()
+        .filter(property_station::Column::PropertyId.is_in(property_ids.iter().copied()))
+        .filter(property_station::Column::WalkMin.gte(0))
+        .order_by_asc(property_station::Column::WalkMin)
         .all(db)
-        .await
+        .await?;
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        map.entry(r.property_id).or_insert(r);
+    }
+    Ok(map)
 }
 
 pub async fn units_for_property(
@@ -495,42 +587,6 @@ pub async fn units_for_property(
         .filter(unit::Column::PropertyId.eq(property_id))
         .all(db)
         .await
-}
-
-pub async fn set_property_station_name(
-    db: &DatabaseConnection,
-    id: i32,
-    name: &str,
-) -> Result<(), DbErr> {
-    property::Entity::update(property::ActiveModel {
-        id: Set(id),
-        station_name: Set(Some(name.to_owned())),
-        updated_at: Set(now()),
-        ..Default::default()
-    })
-    .exec(db)
-    .await?;
-    Ok(())
-}
-
-/// Marks a property's station lookup as attempted-but-failed (the station
-/// name didn't resolve against `station`), storing `-1` as a sentinel so it
-/// doesn't get retried on every batch run. `nearest_station_of` in the engine
-/// treats a negative `station_walk_min` as "no station data".
-pub async fn mark_property_station_unresolved(
-    db: &DatabaseConnection,
-    id: i32,
-) -> Result<(), DbErr> {
-    property::Entity::update(property::ActiveModel {
-        id: Set(id),
-        station_walk_min: Set(Some(-1)),
-        station_car_min: Set(Some(-1)),
-        updated_at: Set(now()),
-        ..Default::default()
-    })
-    .exec(db)
-    .await?;
-    Ok(())
 }
 
 // --------------------------------------------------------------------------

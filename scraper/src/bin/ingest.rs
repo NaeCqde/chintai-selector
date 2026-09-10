@@ -267,7 +267,7 @@ async fn backfill_station_names_cmd(
         .and_then(|s| s.parse().ok())
         .unwrap_or(5_000u64);
 
-    let pending = chintai_db::properties_without_station_name(db, limit).await?;
+    let pending = chintai_db::properties_without_station_rows(db, limit).await?;
     log::info!(
         "backfill-station-names: {} properties pending",
         pending.len()
@@ -275,41 +275,48 @@ async fn backfill_station_names_cmd(
     let (mut found, mut empty) = (0u64, 0u64);
 
     for p in &pending {
-        let mut name = None;
+        let mut names: Vec<String> = Vec::new();
         'units: for u in chintai_db::units_for_property(db, p.id).await? {
             for l in chintai_db::listings_for_unit(db, u.id).await? {
-                if let Some(n) = station_name_from_raw_json(&l.raw_json) {
-                    name = Some(n);
+                let from_this = stations_from_raw_json(&l.raw_json);
+                if !from_this.is_empty() {
+                    names = from_this;
                     break 'units;
                 }
             }
         }
-        match &name {
-            Some(n) => {
-                chintai_db::set_property_station_name(db, p.id, n).await?;
-                found += 1;
+        if names.is_empty() {
+            // Empty-name sentinel row: "checked, no station in any listing" —
+            // so this property leaves `properties_without_station_rows`.
+            chintai_db::upsert_property_station(db, p.id, "", 0).await?;
+            empty += 1;
+        } else {
+            for (rank, n) in names.iter().enumerate() {
+                chintai_db::upsert_property_station(db, p.id, n, rank as i32).await?;
             }
-            // Empty-string sentinel: "checked, no station in any listing" —
-            // distinct from NULL ("not checked yet") so this property isn't
-            // re-selected by every future run.
-            None => {
-                chintai_db::set_property_station_name(db, p.id, "").await?;
-                empty += 1;
-            }
+            found += 1;
         }
     }
     log::info!("backfill-station-names done: found={found} empty={empty}");
     Ok(())
 }
 
-/// Pull `stations[0].station` out of a `NewListing::raw_json` blob
-/// (`{"building":..,"address":..,"stations":[{"line":..,"station":..,"walk_min":..}],"unit":..}`).
-fn station_name_from_raw_json(raw: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    v.pointer("/stations/0/station")
-        .and_then(|s| s.as_str())
-        .map(str::to_owned)
-        .filter(|s| !s.is_empty())
+/// All station names in a `NewListing::raw_json` blob
+/// (`{"building":..,"stations":[{"line":..,"station":..,"walk_min":..}],..}`).
+fn stations_from_raw_json(raw: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    v.pointer("/stations")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.pointer("/station").and_then(|x| x.as_str()))
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Precomputes the *listing's own* station leg: for every property with a
@@ -346,15 +353,13 @@ async fn google_stations_cmd(
     // station-coordinate support existed (added after this crawl was
     // already running against ~150k properties — without this, everything
     // resolved so far would be permanently stuck missing car_min).
-    let car_backfill = chintai_db::properties_needing_station_car_backfill(db, limit).await?;
+    let car_backfill = chintai_db::property_stations_needing_car_backfill(db, limit).await?;
     log::info!(
-        "google-stations: {} properties need car-time backfill",
+        "google-stations: {} station rows need car-time backfill",
         car_backfill.len()
     );
-    for p in &car_backfill {
-        let Some(name) = &p.station_name else {
-            continue;
-        };
+    for (ps, p) in &car_backfill {
+        let name = &ps.station_name;
         let Some(station) = chintai_db::station_by_name(db, name).await? else {
             continue;
         };
@@ -367,19 +372,17 @@ async fn google_stations_cmd(
                 None
             }
         };
-        chintai_db::set_property_station_car(db, p.id, car_min, station.lat, station.lng).await?;
+        chintai_db::set_property_station_car(db, ps.id, car_min, station.lat, station.lng).await?;
         ok += 1;
     }
 
-    let pending = chintai_db::properties_needing_station_time(db, limit).await?;
-    log::info!("google-stations: {} properties pending", pending.len());
+    let pending = chintai_db::property_stations_needing_time(db, limit).await?;
+    log::info!("google-stations: {} station rows pending", pending.len());
 
-    for p in &pending {
-        let Some(name) = &p.station_name else {
-            continue;
-        };
+    for (ps, p) in &pending {
+        let name = &ps.station_name;
         let Some(station) = chintai_db::station_by_name(db, name).await? else {
-            chintai_db::mark_property_station_unresolved(db, p.id).await?;
+            chintai_db::mark_property_station_unresolved(db, ps.id).await?;
             unresolved += 1;
             continue;
         };
@@ -408,7 +411,7 @@ async fn google_stations_cmd(
                 };
                 chintai_db::set_property_station_time(
                     db,
-                    p.id,
+                    ps.id,
                     walk_min,
                     walk_route.distance_m,
                     car_min,
