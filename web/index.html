@@ -20,6 +20,7 @@
             let styleReady = false;
             const markerEls = [];
             let poiSourceReady = false;
+            const activeHazards = new Set();
 
             const OSM_STYLE = {
                 version: 8,
@@ -108,10 +109,27 @@
                         type: "raster",
                         source: id,
                         layout: { visibility: "none" },
-                        paint: { "raster-opacity": 0.6 },
+                        paint: {
+                            "raster-opacity": 0.9,
+                            // Crisp zone edges: no interpolation between tile
+                            // pixels, and a contrast bump so the colour steps
+                            // (= the hazard-zone boundaries) read clearly.
+                            "raster-resampling": "nearest",
+                            "raster-contrast": 0.35,
+                        },
                     },
                     before,
                 );
+            }
+
+            // Grey the base map down while any hazard overlay is on, so the
+            // coloured hazard zones — and their boundaries — stand out.
+            function updateBaseDim() {
+                if (!map || !map.getLayer("osm")) return;
+                const on = activeHazards.size > 0;
+                map.setPaintProperty("osm", "raster-saturation", on ? -0.85 : 0);
+                map.setPaintProperty("osm", "raster-brightness-max", on ? 0.92 : 1);
+                map.setPaintProperty("osm", "raster-contrast", on ? -0.15 : 0);
             }
 
             return {
@@ -213,6 +231,9 @@
                         ensureHazardLayer(id, path);
                         map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
                     }
+                    if (visible) activeHazards.add(kind);
+                    else activeHazards.delete(kind);
+                    updateBaseDim();
                 },
             };
         })();
