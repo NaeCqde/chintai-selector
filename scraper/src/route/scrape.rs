@@ -63,18 +63,19 @@ impl GoogleMapsScrape {
             .get_text(&dir_url, &[("hl", "ja"), ("gl", "jp")])
             .await?;
 
-        let rel = extract_preview_url(&html)
+        let mut rel = extract_preview_url(&html)
             .ok_or_else(|| RouteError::Parse("no preview/directions link in dir HTML".into()))?;
 
-        // Departure-time patching is currently DISABLED for the scrape path:
-        // inserting the `!19m3!1e0!2e2!3j{ts}` block makes Google return a
-        // stripped-down response where a multi-modal transit trip collapses
-        // into pseudo-"walk" steps with no line/station/time detail (verified
-        // against real 蒲田→有明 routes). A "depart now" query returns the
-        // full itinerary, and transit times don't swing much outside rush
-        // hour — a better trade than a broken breakdown. `DepartureTime` is
-        // still honoured by the Routes API path when a key is set.
-        let _ = departure;
+        // Pin the departure time when given (see `patch_departure_time`). If
+        // the anchor isn't in this particular `pb`, fall back to "depart now"
+        // rather than fail — a routed time is better than none.
+        if let Some(d) = departure {
+            if let Some(patched) = patch_departure_time(&rel, e, d) {
+                rel = patched;
+            } else {
+                log::debug!("departure-time anchor not found in pb; using 'now'");
+            }
+        }
         let url = format!("https://www.google.com/{rel}");
 
         let body = self.http.get_text(&url, &[]).await?;
@@ -84,28 +85,32 @@ impl GoogleMapsScrape {
 }
 
 /// Patches a departure time into the auto-generated preview-directions `pb`
-/// (which defaults to "depart now" and has no time fields at all): the
-/// `!20m5!1e{mode}!2e3!5e2!6b1!14b1` block shrinks to `!20m3!5e2!6b1!14b1`
-/// and a new `!19m3!1e0!2e2!3j{ts}` block is inserted right before it.
+/// (which defaults to "depart now" and carries no time field).
 ///
-/// DISABLED at the call site — this transform makes Google return a
-/// stripped-down response that drops all transit line/station/time detail.
-/// Kept (with its tests) as a starting point if the real transform is worked
-/// out later. See `directions_json`.
-#[allow(dead_code)]
+/// A `!19m3!1e2!2e2!3j{ts}` block is inserted immediately before the existing
+/// `!20m5!1e{mode}!2e3!…` block, which is left *intact* — an earlier attempt
+/// also shrank `20m5` to `20m3`, and that is what made Google return a
+/// stripped-down response with no transit line/station/time detail. Verified
+/// against real 蒲田→有明 routes: with `20m5` kept, the response stays full
+/// and the itinerary departs at the requested clock time (± the next
+/// service).
+///
+/// `{ts}` is *not* a true Unix instant: Google reads the JST wall-clock
+/// date/time as literal UTC numerals with no offset (verified — a request at
+/// `ts` whose `ts % 86400` is 19:00 departs ~19:24 JST). So
+/// [`google_naive_departure_timestamp`] builds it that way on purpose.
 fn patch_departure_time(rel: &str, mode_code: u8, d: DepartureTime) -> Option<String> {
-    let from = format!("%2120m5%211e{mode_code}%212e3%215e2%216b1%2114b1");
-    if !rel.contains(&from) {
+    let anchor = format!("%2120m5%211e{mode_code}%212e3");
+    if !rel.contains(&anchor) {
         return None;
     }
     let ts = google_naive_departure_timestamp(d);
-    let to = format!("%2119m3%211e0%212e2%213j{ts}%2120m3%215e2%216b1%2114b1");
-    Some(rel.replacen(&from, &to, 1))
+    let insert = format!("%2119m3%211e2%212e2%213j{ts}{anchor}");
+    Some(rel.replacen(&anchor, &insert, 1))
 }
 
 /// See [`patch_departure_time`]'s doc for why this deliberately does *not*
 /// convert JST to a true UTC instant.
-#[allow(dead_code)]
 fn google_naive_departure_timestamp(d: DepartureTime) -> i64 {
     let jst = FixedOffset::east_opt(9 * 3600).expect("valid fixed offset");
     let now_jst = Utc::now().with_timezone(&jst);
@@ -407,30 +412,32 @@ mod tests {
     const BASELINE_TAIL: &str = "%2117m1%213e1%2120m5%211e3%212e3%215e2%216b1%2114b1%2146m1%211b0";
 
     #[test]
-    fn patch_departure_time_matches_the_real_captured_transformation() {
-        // Shape of the transformation a user captured for a real "depart at
-        // 8:00 JST" transit search. The `3j<epoch>` is the next 8:00 JST from
-        // *now*, so assert the structure, not a frozen timestamp.
+    fn patch_departure_time_inserts_before_an_intact_20m5() {
         let d = DepartureTime::new(8, 0);
-        let patched = patch_departure_time(BASELINE_TAIL, 3, d).expect("pattern must match");
+        let patched = patch_departure_time(BASELINE_TAIL, 3, d).expect("anchor must match");
 
-        let marker = "%2119m3%211e0%212e2%213j";
+        // The 19m3 block sits immediately before the *unchanged* 20m5 block.
+        let marker = "%2119m3%211e2%212e2%213j";
         let at = patched.find(marker).expect("19m3 block inserted");
         let after = &patched[at + marker.len()..];
         let epoch: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
         assert!(epoch.len() >= 10, "epoch digits present, got {epoch:?}");
         let secs: i64 = epoch.parse().unwrap();
-        // Within the next 8 days and in the future (next weekday 08:00 JST).
         let now = chrono::Utc::now().timestamp();
         assert!(
             secs > now && secs < now + 8 * 86_400,
             "epoch {secs} vs now {now}"
         );
-        assert!(after.starts_with(&format!("{epoch}%2120m3%215e2%216b1%2114b1")));
+        // 20m5 (and its 1e3/2e3) is preserved verbatim right after the epoch.
+        assert!(after.starts_with(&format!("{epoch}%2120m5%211e3%212e3%215e2%216b1%2114b1")));
 
-        // Everything outside the patched block is untouched.
+        // Nothing outside the insertion point changed.
         assert!(patched.starts_with("%2117m1%213e1%21"));
         assert!(patched.ends_with("%2146m1%211b0"));
+        assert_eq!(
+            patched.len(),
+            BASELINE_TAIL.len() + marker.len() + epoch.len()
+        );
     }
 
     #[test]
