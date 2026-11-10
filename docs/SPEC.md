@@ -28,8 +28,8 @@
 | メソッド・パス | 内容 |
 |---|---|
 | `GET /api/health` | `ok` |
-| `POST /api/search` | `SearchRequest` を受け、`SearchResponse` を返す。失敗は 500(本文にエラーの文字列) |
-| `GET /api/pois?bbox=s,w,n,e&kinds=…` | 範囲内の店舗・宅配・駅。`kinds` は `convenience`/`supermarket`/`delivery`/`station` のカンマ区切り(既定は 4 つとも)。`bbox` の形が違えば 400、面積(度²)が 1 を超えれば 400。スーパーで価格帯が安いものは `CheapSupermarket` |
+| `POST /api/search` | `SearchRequest` を受け、`SearchResponse` を返す。場所が 10 を超える、または `limit` が 500 を超えれば 400。失敗は 500(本文にエラーの文字列) |
+| `GET /api/pois?bbox=s,w,n,e&kinds=…` | 範囲内の店舗・宅配・駅。`kinds` は `convenience`/`supermarket`/`delivery`/`station` のカンマ区切り(既定は 4 つとも)。`bbox` の形が違えば 400、面積(度²)が 1 を超える・負・非有限なら 400。スーパーで価格帯が安いものは `CheapSupermarket` |
 | `GET /api/geocode?q=…` | 住所・地名を座標にする。見つからなければ `null`。失敗は 502 |
 
 CORS はすべて許可。認証はない。

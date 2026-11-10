@@ -16,10 +16,21 @@ use serde::Deserialize;
 use crate::engine::Engine;
 use crate::AppState;
 
+/// Input-size caps: each place triggers external route lookups.
+const MAX_PLACES: usize = 10;
+const MAX_LIMIT: usize = 500;
+
 pub async fn search(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SearchRequest>,
 ) -> impl IntoResponse {
+    if req.places.len() > MAX_PLACES || req.limit as usize > MAX_LIMIT {
+        return (
+            StatusCode::BAD_REQUEST,
+            "too many places or limit too large",
+        )
+            .into_response();
+    }
     match Engine::new(&state.db, &state.routes).search(&req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => {
@@ -45,7 +56,8 @@ pub async fn pois(
         return (StatusCode::BAD_REQUEST, "bbox must be s,w,n,e").into_response();
     };
     // Guard against someone asking for the whole country at once.
-    if (bbox.2 - bbox.0) * (bbox.3 - bbox.1) > 1.0 {
+    let area = (bbox.2 - bbox.0) * (bbox.3 - bbox.1);
+    if !area.is_finite() || area < 0.0 || area > 1.0 {
         return (StatusCode::BAD_REQUEST, "bbox too large").into_response();
     }
     let want: Vec<&str> = q
