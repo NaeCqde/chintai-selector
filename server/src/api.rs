@@ -25,7 +25,11 @@ pub async fn search(
     Json(req): Json<SearchRequest>,
 ) -> impl IntoResponse {
     if req.places.len() > MAX_PLACES || req.limit as usize > MAX_LIMIT {
-        return (StatusCode::BAD_REQUEST, "too many places or limit too large").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "too many places or limit too large",
+        )
+            .into_response();
     }
     match Engine::new(&state.db, &state.routes).search(&req).await {
         Ok(resp) => Json(resp).into_response(),
