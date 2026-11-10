@@ -91,7 +91,7 @@ jobs:
               run: |
                   v=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/[^0-9.]/,"",$0); print; exit}' Cargo.lock)
                   cargo install wasm-bindgen-cli --locked --version "$v"
-            - run: web/build.sh --release
+            - run: bash web/build.sh --release
             - uses: actions/upload-artifact@v4
               with:
                   name: web-dist
