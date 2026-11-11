@@ -1,5 +1,7 @@
 # chintai-selector
 
+日本語 | [English](README.en.md)
+
 > [!WARNING]
 > **作成途中のプロジェクトです。動作は非常に重く(激重)、まだ実用的ではありません。**
 >
