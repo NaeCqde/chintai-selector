@@ -143,8 +143,9 @@ jobs:
                   [ -f "$DECISION" ] || { echo "no decision file: not merging"; exit 0; }
                   [ "$(jq -r '.merge' "$DECISION")" = "true" ] || { echo "not merged: $(jq -r '.reason' "$DECISION")"; exit 0; }
                   why=$(unfinished) && { say "Not merged automatically: $why."; exit 0; }
-                  # the head now: the review may have pushed a fix
-                  SHA=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
+                  # the head must be exactly what was reviewed (plus the fixes this job pushed): a later push by anybody is not reviewed
+                  SHA=$(git rev-parse HEAD)
+                  [ "$(gh pr view "$PR" --json headRefOid --jq .headRefOid)" = "$SHA" ] || { say "Not merged automatically: the pull request changed after the review."; exit 0; }
                   why=$(wait_ci "$SHA") || { say "Not merged automatically: $why."; exit 0; }
                   gh pr merge "$PR" --squash --match-head-commit "$SHA" && echo "merged"
 
