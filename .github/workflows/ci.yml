@@ -251,7 +251,7 @@ jobs:
                   mkdir signed
                   n=0
                   for f in in/*macOS*; do
-                    case "$f" in *.sha256) continue ;; esac
+                    case "$f" in *.sha256|*/TREE-*) continue ;; esac
                     [ -f "$f" ] || continue
                     b=$(basename "$f")
                     cp "$f" "signed/$b"
