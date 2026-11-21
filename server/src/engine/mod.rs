@@ -112,12 +112,17 @@ fn prepend_drive_leg(leg1_minutes: u32, mut leg2: RouteResult) -> RouteResult {
 }
 
 /// `f64` ordered as the comparison before: a value that cannot be compared (NaN) counts as equal.
-#[derive(PartialEq, PartialOrd)]
+#[derive(PartialEq)]
 struct OrdF64(f64);
 impl Eq for OrdF64 {}
+impl PartialOrd for OrdF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 impl Ord for OrdF64 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
