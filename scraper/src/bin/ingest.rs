@@ -305,19 +305,26 @@ async fn backfill_station_names_cmd(
 /// All station names in a `NewListing::raw_json` blob
 /// (`{"building":..,"stations":[{"line":..,"station":..,"walk_min":..}],..}`).
 fn stations_from_raw_json(raw: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+    // read in place: the names are borrowed from `raw` (only an escaped name is copied), and nothing else of the blob is built
+    #[derive(serde::Deserialize)]
+    struct Blob<'a> {
+        #[serde(borrow, default)]
+        stations: Vec<Leg<'a>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Leg<'a> {
+        #[serde(borrow, default)]
+        station: Option<std::borrow::Cow<'a, str>>,
+    }
+    let Ok(blob) = serde_json::from_str::<Blob>(raw) else {
         return Vec::new();
     };
-    v.pointer("/stations")
-        .and_then(|s| s.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.pointer("/station").and_then(|x| x.as_str()))
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    blob.stations
+        .into_iter()
+        .filter_map(|leg| leg.station)
+        .filter(|s| !s.is_empty())
+        .map(std::borrow::Cow::into_owned)
+        .collect()
 }
 
 /// Precomputes the *listing's own* station leg: for every property with a
@@ -496,4 +503,17 @@ fn print_usage() {
          google-stations [--limit N]                Google-Maps-scrape walk time to each\n\
                                                     property's listed station (default 2000/run)\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stations_from_raw_json;
+
+    #[test]
+    fn station_names_are_read_in_place() {
+        let raw = r#"{"building":"x","stations":[{"line":"a","station":"渋谷","walk_min":3},{"station":""},{"line":"b"},{"station":"駒場 \"east\""}]}"#;
+        assert_eq!(stations_from_raw_json(raw), vec!["渋谷".to_string(), "駒場 \"east\"".to_string()]);
+        assert!(stations_from_raw_json(r#"{"building":"x"}"#).is_empty());
+        assert!(stations_from_raw_json("not json").is_empty());
+    }
 }

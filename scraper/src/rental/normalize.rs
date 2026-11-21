@@ -4,15 +4,25 @@
 
 /// Fold full-width ASCII / digits / spaces to half-width and trim.
 pub fn to_halfwidth(s: &str) -> String {
-    s.chars()
+    let folded: String = s
+        .chars()
         .map(|c| match c {
             '　' => ' ',
             '！'..='～' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
             _ => c,
         })
-        .collect::<String>()
-        .trim()
-        .to_string()
+        .collect();
+    trimmed(folded)
+}
+
+/// `s` without surrounding whitespace; the buffer is reused when there is nothing to cut.
+fn trimmed(s: String) -> String {
+    let t = s.trim();
+    if t.len() == s.len() {
+        s
+    } else {
+        t.to_owned()
+    }
 }
 
 const BUILDING_SUFFIXES: &[&str] = &[
@@ -29,28 +39,40 @@ const BUILDING_SUFFIXES: &[&str] = &[
 /// Canonical building name: half-width, whitespace collapsed, trailing
 /// building-type words removed, lower-cased.
 pub fn norm_building_name(s: &str) -> String {
-    let mut t = to_halfwidth(s).to_lowercase();
-    t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered = to_halfwidth(s).to_lowercase();
+    // whitespace collapsed to single spaces, as one pass over the words
+    let mut t = String::with_capacity(lowered.len());
+    for word in lowered.split_whitespace() {
+        if !t.is_empty() {
+            t.push(' ');
+        }
+        t.push_str(word);
+    }
+    // the suffixes are katakana: they have no lower case, so they are compared as they are
+    let mut end = t.len();
     for suf in BUILDING_SUFFIXES {
-        if let Some(stripped) = t.strip_suffix(&suf.to_lowercase()) {
-            t = stripped.trim().to_string();
+        if let Some(stripped) = t[..end].strip_suffix(suf) {
+            end = stripped.trim().len();
         }
     }
-    t.replace(['・', '.', '-', '−', 'ー', '　'], "")
-        .replace(' ', "")
+    t[..end]
+        .chars()
+        .filter(|c| !matches!(c, '・' | '.' | '-' | '−' | 'ー' | '　' | ' '))
+        .collect()
 }
 
 /// Canonical address: drop the leading prefecture, half-width digits, and
 /// collapse 丁目/番地/番/号 + separators into '-'.
 pub fn norm_address(s: &str) -> String {
-    let mut t = to_halfwidth(s);
+    let folded = to_halfwidth(s);
+    let mut t: &str = &folded;
     for pref in crate::poi::prefectures::all() {
         if let Some(rest) = t.strip_prefix(pref.name) {
-            t = rest.to_string();
+            t = rest;
             break;
         }
     }
-    let mut out = String::new();
+    let mut out = String::with_capacity(t.len());
     for c in t.chars() {
         match c {
             '丁' | '目' | '番' | '地' | '号' | ' ' | '　' | '−' | 'ー' | '‐' => {
@@ -61,7 +83,12 @@ pub fn norm_address(s: &str) -> String {
             _ => out.push(c),
         }
     }
-    out.trim_matches('-').to_string()
+    let cut = out.trim_matches('-');
+    if cut.len() == out.len() {
+        out
+    } else {
+        cut.to_owned()
+    }
 }
 
 /// Parse a Japanese money string: "13.5万円" -> 135000, "3,000円" -> 3000,
