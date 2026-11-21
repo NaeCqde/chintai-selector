@@ -53,3 +53,7 @@ the Google Routes API (without it, only the total time from the scrape is used).
 
 Data sources: OpenStreetMap (Overpass / Nominatim / GSI elevation), SUUMO and LIFULL HOME'S,
 route search by scraping Google Maps → (with a key) the Google Routes API. The map is MapLibre GL with OSM tiles.
+
+## Where the settings are read from
+
+`.env`: the current directory is searched first. If the file is there, only that one is read; if not, the one in the directory of the executable is read.
