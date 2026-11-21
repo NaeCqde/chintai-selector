@@ -409,6 +409,7 @@ dependencies = [
  "chintai-db",
  "chintai-types",
  "chrono",
+ "dotenvy",
  "encoding_rs",
  "env_logger",
  "log",

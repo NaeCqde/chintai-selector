@@ -14,6 +14,7 @@ use chintai_scraper::HttpClient;
 
 #[tokio::main]
 async fn main() {
+    chintai_scraper::load_env();
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     if let Err(e) = run().await {
         log::error!("{e:#}");

@@ -25,6 +25,7 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    chintai_scraper::load_env();
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
     let db_url = std::env::var("CHINTAI_DB")

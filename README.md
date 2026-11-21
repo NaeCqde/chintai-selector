@@ -53,3 +53,7 @@ Google Routes API から取得される（未設定時はスクレイプの合�
 
 外部データ源: OpenStreetMap（Overpass / Nominatim / GSI 標高）、SUUMO・LIFULL HOME'S、
 ルート検索は Google Maps スクレイプ →（鍵があれば）Google Routes API。地図は MapLibre GL + OSM タイル。
+
+## 設定ファイルの場所
+
+`.env` は、まずカレントディレクトリから探します。カレントディレクトリにあれば、それだけを読みます。なければ、実行ファイルがあるディレクトリのファイルを読みます。
