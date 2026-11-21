@@ -449,3 +449,18 @@ async fn pickup_transit_excludes_properties_without_a_precomputed_car_leg() {
         "property without a precomputed car leg should be dropped, not guessed at"
     );
 }
+
+#[test]
+fn the_indexed_nearest_poi_is_the_brute_force_haversine() {
+    // a grid of points around Tokyo; the nearest of each kind must equal the plain loop over `haversine_m`
+    let pts: Vec<(f64, f64)> = (0..40)
+        .map(|i| (35.5 + (i as f64 * 0.0137) % 0.4, 139.5 + (i as f64 * 0.0291) % 0.5))
+        .collect();
+    let points: Vec<Point> = pts.iter().map(|&(la, ln)| Point::new(la, ln)).collect();
+    for from in [(35.6580, 139.7016), (35.70, 139.60), (35.5, 139.5)] {
+        let expected = pts.iter().map(|&(la, ln)| haversine_m(from.0, from.1, la, ln)).fold(f64::INFINITY, f64::min);
+        let got = nearest_m(&Point::new(from.0, from.1), &points).unwrap();
+        assert!((got - expected).abs() < 1e-6, "{got} vs {expected}");
+    }
+    assert_eq!(nearest_m(&Point::new(35.0, 139.0), &[]), None);
+}

@@ -39,6 +39,9 @@ const ROUTE_CAP: usize = 60;
 /// is the source of truth for what actually gets listed.
 const ESTIMATE_SLACK: f64 = 1.35;
 
+/// How many candidates are verified with real routes at the same time.
+const VERIFY_CONCURRENCY: usize = 6;
+
 /// Optimistic door-to-door speed as metres per minute — a candidate further
 /// than `minutes * this` from a place cannot possibly reach it in time, so it
 /// is dropped before routing.
@@ -108,6 +111,16 @@ fn prepend_drive_leg(leg1_minutes: u32, mut leg2: RouteResult) -> RouteResult {
     leg2
 }
 
+/// `f64` ordered as the comparison before: a value that cannot be compared (NaN) counts as equal.
+#[derive(PartialEq, PartialOrd)]
+struct OrdF64(f64);
+impl Eq for OrdF64 {}
+impl Ord for OrdF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
 fn straight_line_sum(c: &Candidate, places: &[PlaceSpec]) -> f64 {
     let (lat, lng) = (c.prop.lat.unwrap(), c.prop.lng.unwrap());
     places
@@ -148,6 +161,8 @@ impl<'a> Engine<'a> {
 
         let stores = chintai_db::stores_with_brand(self.db).await?;
         let deliveries = chintai_db::deliveries_with_coords(self.db).await?;
+        // the trigonometry of every POI is done once here, not once per property
+        let pois = PoiIndex::new(&stores, &deliveries);
 
         let mut candidates: Vec<Candidate> = Vec::new();
         for (_, (prop, units)) in by_prop {
@@ -167,7 +182,7 @@ impl<'a> Engine<'a> {
             }
 
             let (plat, plng) = (prop.lat.unwrap(), prop.lng.unwrap());
-            let near = NearbyPois::compute(plat, plng, &stores, &deliveries);
+            let near = pois.nearest(plat, plng);
 
             if let Some(max) = req.filters.max_conveni_walk_min {
                 if near.conveni_m.map(walk_minutes).is_none_or(|m| m > max) {
@@ -211,11 +226,8 @@ impl<'a> Engine<'a> {
                     <= reachable_ceiling_m(place.mode, place.max_minutes)
             })
         });
-        candidates.sort_by(|a, b| {
-            straight_line_sum(a, &req.places)
-                .partial_cmp(&straight_line_sum(b, &req.places))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // each candidate's distance is worked out once, not once per comparison (the order is the same; a NaN sorts as equal)
+        candidates.sort_by_cached_key(|c| OrdF64(straight_line_sum(c, &req.places)));
         let plausible = candidates.len();
         candidates.truncate(ROUTE_CAP);
         let capped = plausible > candidates.len();
@@ -312,75 +324,44 @@ impl<'a> Engine<'a> {
         let want = req.limit.max(1) as usize;
         let mut kept: Vec<(f64, RoutedCandidate)> = Vec::with_capacity(want);
         let mut verified = 0usize;
-        for (score, mut rc, _) in scored {
-            if kept.len() >= want {
+        // The candidates are verified a few at a time (the routes are network calls or cache reads, so they wait on each
+        // other for no reason). A wave is never larger than the number of properties still missing, so no more
+        // candidates are checked than before, and the results are taken in rank order.
+        let mut ranked = scored.into_iter();
+        while kept.len() < want {
+            let wave: Vec<_> = ranked
+                .by_ref()
+                .take((want - kept.len()).clamp(1, VERIFY_CONCURRENCY))
+                .collect();
+            if wave.is_empty() {
                 break;
             }
-            verified += 1;
-            let origin = LatLng::new(rc.c.prop.lat.unwrap(), rc.c.prop.lng.unwrap());
-            let mut all_cleared = true;
-            for (pa, place) in rc.places.iter_mut().zip(&req.places) {
-                let dest = LatLng::new(place.lat, place.lng);
-
-                let real = if place.mode == Mode::PickupTransit {
-                    // Leg 1 (property -> station, car) is fixed, precomputed
-                    // data — never a live call. Leg 2 (station -> place,
-                    // transit) is refined live like any other place, just
-                    // from the station instead of the property, departing
-                    // after the drive.
-                    match station_car_leg(rc.c.station.as_ref()) {
-                        Some((car_min, station)) => route_cached(
-                            self.db,
-                            self.provider,
-                            station,
-                            dest,
-                            Mode::Transit,
-                            Some(place.departure.plus_minutes(car_min as i64)),
-                        )
-                        .await
-                        .map(|leg2| prepend_drive_leg(car_min, leg2)),
-                        None => Ok(RouteResult::unresolvable(place.mode)),
-                    }
-                } else {
-                    route_cached(
-                        self.db,
-                        self.provider,
-                        origin,
-                        dest,
-                        place.mode,
-                        Some(place.departure),
-                    )
-                    .await
-                };
-
-                match real {
-                    Ok(real) => {
-                        let minutes = (real.duration.as_secs() as f64 / 60.0).ceil() as u32;
-                        pa.minutes = minutes;
-                        pa.within_limit = minutes <= place.max_minutes;
-                        pa.route = real;
-                        all_cleared &= pa.within_limit;
-                    }
-                    // Couldn't get a real route — don't guess. An unverified
-                    // place is not a cleared place, so this property is out.
-                    Err(e) => {
-                        log::debug!("verify route failed for place {:?}: {e}", place.label);
-                        pa.within_limit = false;
-                        all_cleared = false;
-                    }
-                }
-            }
-            if all_cleared {
-                kept.push((score, rc));
-            }
+            verified += wave.len();
+            let done =
+                futures::future::join_all(wave.into_iter().map(|(score, mut rc, _)| async move {
+                    let cleared = self.verify(&mut rc, req).await;
+                    (score, rc, cleared)
+                }))
+                .await;
+            kept.extend(
+                done.into_iter()
+                    .filter(|(_, _, cleared)| *cleared)
+                    .map(|(score, rc, _)| (score, rc)),
+            );
         }
 
         let matched = kept.len();
 
         // --- 4. materialise ------------------------------------------------
+        // the listings of every shown unit in one query (not one per unit)
+        let unit_ids: Vec<i32> = kept
+            .iter()
+            .flat_map(|(_, rc)| rc.c.units.iter().map(|u| u.id))
+            .collect();
+        let mut listings = chintai_db::listings_for_units(self.db, &unit_ids).await?;
         let mut results = Vec::with_capacity(kept.len());
         for (i, (score, rc)) in kept.into_iter().enumerate() {
-            results.push(self.to_ranked(i as u32 + 1, score, rc).await?);
+            results.push(self.to_ranked(i as u32 + 1, score, rc, &mut listings));
         }
 
         Ok(SearchResponse {
@@ -393,12 +374,71 @@ impl<'a> Engine<'a> {
         })
     }
 
-    async fn to_ranked(
+    /// Replaces every place's estimate with a real route and says whether all of them are within their limits.
+    async fn verify(&self, rc: &mut RoutedCandidate, req: &SearchRequest) -> bool {
+        let origin = LatLng::new(rc.c.prop.lat.unwrap(), rc.c.prop.lng.unwrap());
+        let mut all_cleared = true;
+        for (pa, place) in rc.places.iter_mut().zip(&req.places) {
+            let dest = LatLng::new(place.lat, place.lng);
+
+            let real = if place.mode == Mode::PickupTransit {
+                // Leg 1 (property -> station, car) is fixed, precomputed
+                // data — never a live call. Leg 2 (station -> place,
+                // transit) is refined live like any other place, just
+                // from the station instead of the property, departing
+                // after the drive.
+                match station_car_leg(rc.c.station.as_ref()) {
+                    Some((car_min, station)) => route_cached(
+                        self.db,
+                        self.provider,
+                        station,
+                        dest,
+                        Mode::Transit,
+                        Some(place.departure.plus_minutes(car_min as i64)),
+                    )
+                    .await
+                    .map(|leg2| prepend_drive_leg(car_min, leg2)),
+                    None => Ok(RouteResult::unresolvable(place.mode)),
+                }
+            } else {
+                route_cached(
+                    self.db,
+                    self.provider,
+                    origin,
+                    dest,
+                    place.mode,
+                    Some(place.departure),
+                )
+                .await
+            };
+
+            match real {
+                Ok(real) => {
+                    let minutes = (real.duration.as_secs() as f64 / 60.0).ceil() as u32;
+                    pa.minutes = minutes;
+                    pa.within_limit = minutes <= place.max_minutes;
+                    pa.route = real;
+                    all_cleared &= pa.within_limit;
+                }
+                // Couldn't get a real route — don't guess. An unverified
+                // place is not a cleared place, so this property is out.
+                Err(e) => {
+                    log::debug!("verify route failed for place {:?}: {e}", place.label);
+                    pa.within_limit = false;
+                    all_cleared = false;
+                }
+            }
+        }
+        all_cleared
+    }
+
+    fn to_ranked(
         &self,
         rank: u32,
         score: f64,
         rc: RoutedCandidate,
-    ) -> anyhow::Result<RankedProperty> {
+        listings: &mut HashMap<i32, Vec<entities::listing::Model>>,
+    ) -> RankedProperty {
         let RoutedCandidate { c, places } = rc;
         let nearest_station = nearest_station_of(c.station.as_ref());
         let mut units = c.units;
@@ -406,8 +446,9 @@ impl<'a> Engine<'a> {
 
         let mut views = Vec::with_capacity(units.len());
         for u in &units {
-            let sources = chintai_db::listings_for_unit(self.db, u.id)
-                .await?
+            let sources = listings
+                .remove(&u.id)
+                .unwrap_or_default()
                 .into_iter()
                 .map(|l| UnitSource {
                     site: format!("{:?}", l.site).to_lowercase(),
@@ -418,7 +459,7 @@ impl<'a> Engine<'a> {
         }
         let best_unit = views.remove(0);
 
-        Ok(RankedProperty {
+        RankedProperty {
             rank,
             score,
             property_id: c.prop.id,
@@ -436,7 +477,7 @@ impl<'a> Engine<'a> {
             nearest_super_m: c.near.super_m,
             nearest_cheap_super_m: c.near.cheap_super_m,
             nearest_delivery_m: c.near.delivery_m,
-        })
+        }
     }
 }
 
@@ -464,37 +505,85 @@ struct NearbyPois {
     delivery_m: Option<f64>,
 }
 
-impl NearbyPois {
-    fn compute(
-        lat: f64,
-        lng: f64,
+/// The stores and delivery points with their angles and cosines worked out once, for the nearest-POI search of every
+/// property (the same haversine formula as `haversine_m`).
+struct PoiIndex {
+    conveni: Vec<Point>,
+    supers: Vec<Point>,
+    cheap_supers: Vec<Point>,
+    deliveries: Vec<Point>,
+}
+
+#[derive(Clone, Copy)]
+struct Point {
+    lat: f64,
+    lng: f64,
+    cos_lat: f64,
+}
+
+impl Point {
+    fn new(lat_deg: f64, lng_deg: f64) -> Self {
+        let lat = lat_deg.to_radians();
+        Point {
+            lat,
+            lng: lng_deg.to_radians(),
+            cos_lat: lat.cos(),
+        }
+    }
+
+    /// The haversine term (increasing with the distance), so that the nearest can be picked without `sqrt` and `asin`.
+    fn hav(&self, o: &Point) -> f64 {
+        let dp = o.lat - self.lat;
+        let dl = o.lng - self.lng;
+        (dp / 2.0).sin().powi(2) + self.cos_lat * o.cos_lat * (dl / 2.0).sin().powi(2)
+    }
+}
+
+fn nearest_m(from: &Point, points: &[Point]) -> Option<f64> {
+    let best = points.iter().map(|p| from.hav(p)).min_by(f64::total_cmp)?;
+    Some(2.0 * 6_371_000.0 * best.sqrt().asin())
+}
+
+impl PoiIndex {
+    fn new(
         stores: &[(entities::store::Model, entities::brand::Model)],
         deliveries: &[entities::delivery::Model],
     ) -> Self {
         use chintai_db::entities::enums::BrandKind;
-        let mut n = NearbyPois::default();
+        let mut index = PoiIndex {
+            conveni: Vec::new(),
+            supers: Vec::new(),
+            cheap_supers: Vec::new(),
+            deliveries: Vec::new(),
+        };
         for (s, b) in stores {
-            let d = haversine_m(lat, lng, s.lat.unwrap(), s.lng.unwrap());
+            let p = Point::new(s.lat.unwrap(), s.lng.unwrap());
             match b.kind {
-                BrandKind::ConvenienceStore => min_into(&mut n.conveni_m, d),
+                BrandKind::ConvenienceStore => index.conveni.push(p),
                 BrandKind::Supermarket => {
-                    min_into(&mut n.super_m, d);
+                    index.supers.push(p);
                     if b.price_tier == PriceTier::Cheap {
-                        min_into(&mut n.cheap_super_m, d);
+                        index.cheap_supers.push(p);
                     }
                 }
             }
         }
-        for de in deliveries {
-            let d = haversine_m(lat, lng, de.lat.unwrap(), de.lng.unwrap());
-            min_into(&mut n.delivery_m, d);
-        }
-        n
+        index.deliveries = deliveries
+            .iter()
+            .map(|d| Point::new(d.lat.unwrap(), d.lng.unwrap()))
+            .collect();
+        index
     }
-}
 
-fn min_into(slot: &mut Option<f64>, v: f64) {
-    *slot = Some(slot.map_or(v, |cur| cur.min(v)));
+    fn nearest(&self, lat: f64, lng: f64) -> NearbyPois {
+        let from = Point::new(lat, lng);
+        NearbyPois {
+            conveni_m: nearest_m(&from, &self.conveni),
+            super_m: nearest_m(&from, &self.supers),
+            cheap_super_m: nearest_m(&from, &self.cheap_supers),
+            delivery_m: nearest_m(&from, &self.deliveries),
+        }
+    }
 }
 
 fn unit_passes(u: &entities::unit::Model, f: &Filters) -> bool {
