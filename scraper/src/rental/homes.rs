@@ -32,11 +32,16 @@ impl Homes {
 }
 
 fn text(el: ElementRef) -> String {
-    el.text()
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    // the text nodes are joined first (a word can be split by a tag); the words then go once into the result
+    let raw: String = el.text().collect();
+    let mut out = String::with_capacity(raw.len());
+    for word in raw.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
 }
 fn sel(s: &str) -> Selector {
     Selector::parse(s).expect("static selector")
