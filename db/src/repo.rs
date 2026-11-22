@@ -989,6 +989,28 @@ pub async fn listings_for_unit(
         .await
 }
 
+/// The listings of several units in one query, grouped by unit.
+pub async fn listings_for_units(
+    db: &DatabaseConnection,
+    unit_ids: &[i32],
+) -> Result<std::collections::HashMap<i32, Vec<listing::Model>>, DbErr> {
+    let mut map: std::collections::HashMap<i32, Vec<listing::Model>> =
+        std::collections::HashMap::new();
+    if unit_ids.is_empty() {
+        return Ok(map);
+    }
+    let rows = listing::Entity::find()
+        .filter(listing::Column::UnitId.is_in(unit_ids.iter().copied()))
+        .all(db)
+        .await?;
+    for l in rows {
+        if let Some(unit_id) = l.unit_id {
+            map.entry(unit_id).or_default().push(l);
+        }
+    }
+    Ok(map)
+}
+
 /// Total rows returned by a query — handy for ingest logging and tests, e.g.
 /// `count(db, store::Entity::find()).await?`.
 pub async fn count<E>(db: &DatabaseConnection, query: Select<E>) -> Result<u64, DbErr>
